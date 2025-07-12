@@ -1,5 +1,5 @@
 ### Helpers for sampling from models.
-from models.qwen3 import Qwen3Model, KVCache, count_left_padding
+from lmpo.models.qwen3 import Qwen3Model, KVCache, count_left_padding
 import jax.numpy as jnp
 import numpy as np
 import jax

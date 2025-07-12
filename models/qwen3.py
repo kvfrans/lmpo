@@ -273,7 +273,7 @@ def create_model_from_hf(hf_dir: str):
     return model, params
 
 def create_model_from_ckpt(ckpt_dir: str):
-    from utils.checkpoint import Checkpoint
+    from lmpo.utils.checkpoint import Checkpoint
     with open(ckpt_dir + "config.json") as f:
         cfg = json.load(f)
     model = Qwen3Model(
