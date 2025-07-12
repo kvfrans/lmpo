@@ -25,10 +25,10 @@ def main(model_id: str, dest_root_path: str | Path):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument(
-        "--model-id", required=True, help=f"HuggingFace model / repo id. Examples include: {example_models}"
+        "--model_id", required=True, help=f"HuggingFace model / repo id. Examples include: {example_models}"
     )
     parser.add_argument(
-        "--dest-root-path",
+        "--dest_root_path",
         required=True,
         default="~/",
         help="Destination root directory, the model will be saved into its own directory.",
