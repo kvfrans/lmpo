@@ -30,10 +30,12 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
     token_mask = jnp.where(prompt_tokens != pad_id, 1, 0).astype(jnp.int32)
     max_seq_len = prompt_tokens.shape[1] + num_generation_tokens
 
-    cache = KVCache.create(model.num_layers, batch_size, max_seq_len, model.head_dim, model.kv_heads)
-    cache = cache.replace(starts=count_left_padding(prompt_tokens, pad_id=pad_id))
     cache_sharding = KVCache.get_sharding(data_shard, no_shard)
-    cache = jax.jit(lambda x: x, out_shardings=cache_sharding)(cache)
+    @partial(jax.jit, out_shardings=cache_sharding)
+    def get_cache():
+        return KVCache.create(model.num_layers, batch_size, max_seq_len, model.head_dim, model.kv_heads)
+    cache = get_cache()  # [batch, num_layers, max_seq_len, head_dim]
+    cache = cache.replace(starts=count_left_padding(prompt_tokens, pad_id=pad_id))
 
     if model_apply is None:
         @partial(jax.jit, out_shardings=(data_shard, cache_sharding))

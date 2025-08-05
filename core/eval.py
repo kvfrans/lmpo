@@ -84,7 +84,7 @@ if __name__ == '__main__':
         'prompt_length': 256, # Length of the prompt to pad to.
         'num_epochs': 1,
         # sampling settings.
-        'inference_batch_per_device': 4, # Set this to the maximum until OOM. Should not affect results.
+        'inference_batch_per_device': 16, # Set this to the maximum until OOM. Should not affect results.
     })
     define_flag_dict(config)
     FLAGS = flags.FLAGS
