@@ -33,6 +33,7 @@ from lmpo.core.eval import eval_model
 config = ml_collections.ConfigDict({
     'wandb_project': "lmpo",
     'wandb_name': 'lmpo-run',
+    'wandb_group': 'Default',
     'model_dir': '/nfs/gcs/jaxconverted/Qwen3-1.7B/',
     'save_dir': "",
     'save_interval': 20,
@@ -60,7 +61,7 @@ define_flag_dict(config)
 FLAGS = flags.FLAGS
 FLAGS(sys.argv)
 if jax.process_index() == 0:
-    setup_wandb(FLAGS.flag_values_dict(), project=FLAGS.wandb_project, name=FLAGS.env_name+'-'+FLAGS.wandb_name)
+    setup_wandb(FLAGS.flag_values_dict(), project=FLAGS.wandb_project, name=FLAGS.env_name+'-'+FLAGS.wandb_name, group=FLAGS.wandb_group)
     rollouts_list = []
 
 host_id = jax.process_index()
