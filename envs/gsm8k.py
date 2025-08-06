@@ -1,8 +1,9 @@
 '''From https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb'''
 
-from envs.base import BaseEnv, BaseState
 from dataclasses import dataclass, replace
 import numpy as np
+
+from lmpo.envs.base import BaseEnv, BaseState
 
 def extract_xml_answer(text: str) -> float:
     try:

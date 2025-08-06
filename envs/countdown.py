@@ -1,12 +1,13 @@
 '''From https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb and https://github.com/open-thought/reasoning-gym/blob/main/reasoning_gym/games/countdown.py'''
 
-from envs.base import BaseEnv, BaseState
 from dataclasses import dataclass, replace
 import numpy as np
 import re
 import sympy
 from sympy import Symbol, symbols
 from sympy.parsing.sympy_parser import parse_expr
+
+from lmpo.envs.base import BaseEnv, BaseState
 
 SYSTEM_PROMPT = "You are a helpful assistant. You first think about the reasoning process in the mind, and then provide the user with the answer."
 USER_PROMPT = "Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. Think for only ten sentences, then return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>."

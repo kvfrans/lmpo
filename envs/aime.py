@@ -1,8 +1,9 @@
 '''From https://github.com/agentica-project/rllm and https://github.com/agentica-project/rllm/blob/main/rllm/rewards/math_utils/utils.py'''
 
-from envs.base import BaseEnv, BaseState
 from dataclasses import dataclass, replace
-from envs.deepscaler_utils import grade_answer
+
+from lmpo.envs.base import BaseEnv, BaseState
+from lmpo.envs.deepscaler_utils import grade_answer
 
 def extract_xml_answer(text: str) -> float:
     try:

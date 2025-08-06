@@ -1,6 +1,7 @@
-from envs.base import BaseEnv, BaseState
 from dataclasses import dataclass, replace
 import numpy as np
+
+from lmpo.envs.base import BaseEnv, BaseState
 
 @dataclass(frozen=True)
 class PoemState(BaseState):

@@ -1,11 +1,11 @@
 ### Helpers for sampling from models.
-from models.qwen3 import Qwen3Model, KVCache, count_left_padding
 import jax.numpy as jnp
 import numpy as np
 import jax
 from functools import partial
 
 from lmpo.utils.sharding import host_gather
+from lmpo.models.qwen3 import Qwen3Model, KVCache, count_left_padding
 
 def pad_and_collate(token_batch: list, pad_id: int = 0, force_length: int = None):
     max_len = max([len(x) for x in token_batch])
@@ -91,7 +91,7 @@ if __name__ == "__main__":
     from lmpo.models.tokenizer import create_tokenizer
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ckpt_dir', type=str, default='/nfs/gcs/jaxconverted/Qwen3-0.6B/')
+    parser.add_argument('--ckpt-dir', type=str, default='/nfs/gcs/jaxconverted/Qwen3-0.6B/')
     args = parser.parse_args()
     ckpt_dir = args.ckpt_dir
 

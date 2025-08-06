@@ -33,7 +33,7 @@ pip install numpy absl-py ml-collections wandb einops jaxtyping opt-einsum trans
 Then, download the Qwen checkpoints and convert into a Jax checkpoint.
 ```bash
 python models/download_model.py --model_id Qwen/Qwen3-1.7B --dest_root_path ~/checkpoints/hf/
-python models/hf_to_jax.py --hf_dir ~/checkpoints/hf/Qwen3-1.7B/ --ckpt_dir ~/checkpoints/Qwen3-1.7B/
+python models/hf_to_jax.py --hf_dir ~/checkpoints/hf/Qwen3-1.7B/ --model_dir ~/checkpoints/Qwen3-1.7B/
 
 # On a multi-host machine, use:
 TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_DEVICES=0,1,2,3 python models/hf_to_jax.py
@@ -41,7 +41,7 @@ TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_DEVICES=
 
 To test if everything worked, you can try running the sampling code.
 ```bash
-python core/sampling.py --ckpt_dir ~/checkpoints/Qwen3-1.7B/
+python core/sampling.py --model_dir ~/checkpoints/Qwen3-1.7B/
 ```
 
 To train GRPO, try the following command to train against PoemLength. This is a very easy environment, where reward is proportional to number of output characters. You should see `return` reach 1900 within 200 steps, in about 10 minutes.
