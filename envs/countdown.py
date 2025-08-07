@@ -122,7 +122,7 @@ def generate_expression(rng):
 class CountdownEnv(BaseEnv):
     def __init__(self, tokenizer):
         super().__init__() 
-        self.tokens_per_action = 512
+        self.tokens_per_action = 1024
         self.force_answer_at = 50
         self.data_dict = {}
         self.tokenizer = tokenizer

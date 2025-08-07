@@ -40,7 +40,7 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
     if model_apply is None:
         @partial(jax.jit, out_shardings=(data_shard, cache_sharding))
         def model_apply(params, tokens, token_mask, cache):
-            print("JIT compiling sampling for tokens of shape", tokens.shape)
+            print("JIT compiling sampling for tokens of shape", tokens.shape, "max_seq_len", max_seq_len)
             return model.apply({'params': params}, tokens, token_mask, cache=cache)
 
     # Fill cache with the prompt tokens.
