@@ -27,9 +27,6 @@ def create_sharding(shard_type, train_state_shape=None):
             min_size_to_shard_mb = 4
             if np.prod(shape) * param.dtype.itemsize <= min_size_to_shard_mb * (2 ** 20):
                 return all_nones
-            if len(shape) == 2 and shape[1] > 150000:
-                # Don't shard the output layer, because all-gather takes a long time.
-                return all_nones
             
             # idx = np.argsort(shape)[::-1]
             idx = np.arange(len(shape))
