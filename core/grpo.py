@@ -291,6 +291,7 @@ for i in tqdm.tqdm(range(10000)):
             info['env_epochs'] = total_rollouts / env_num_tasks
         info['rollout_iters_per_update'] = num_rollout_iters
         info['global_step'] = i
+        info['time_per_inference_iteration'] = rollout_total_time / num_rollout_iters
         info['time_per_rollout'] = rollout_total_time / (num_rollout_iters * rollout_batch_size * jax.host_count())
         info['time_per_effective_rollout'] = rollout_total_time / global_batch_size
         info['effective_rollout_ratio'] = global_batch_size / (rollout_batch_size * jax.host_count() * num_rollout_iters)
