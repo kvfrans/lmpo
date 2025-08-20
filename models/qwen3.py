@@ -168,7 +168,7 @@ class Qwen3Model(nn.Module):
     eps: float = 1e-6
 
     @nn.compact
-    def __call__(self, x, token_mask, cache = None):
+    def __call__(self, x, token_mask, cache = None, get_logits=True):
         x = nn.Embed(num_embeddings=self.vocab_size, features=self.hidden_size)(x)
         x = x.astype(jnp.bfloat16)
         positions = get_positions(token_mask)
@@ -187,7 +187,10 @@ class Qwen3Model(nn.Module):
 
         gamma_final = self.param('gamma_final', nn.initializers.constant(1.0), (self.hidden_size,))
         x = rms_norm(x, gamma_final, self.eps)
-        logits = nn.Dense(self.vocab_size, use_bias=False)(x)
+        if get_logits:
+            logits = nn.Dense(self.vocab_size, use_bias=False)(x)
+        else:
+            logits = None
 
         if cache is not None:
             cache = cache.replace(length=cache.length + jnp.max(length_minus_padding(token_mask)))
@@ -273,7 +276,7 @@ def create_model_from_hf(hf_dir: str):
     return model, params
 
 def create_model_from_ckpt(ckpt_dir: str):
-    from utils.checkpoint import Checkpoint
+    from lmpo.utils.checkpoint import Checkpoint
     with open(ckpt_dir + "config.json") as f:
         cfg = json.load(f)
     model = Qwen3Model(
