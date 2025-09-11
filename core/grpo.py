@@ -13,7 +13,7 @@ from absl import app, flags
 
 try: # If you like to use these helpers, you can.
     from jax.experimental.compilation_cache import compilation_cache as cc
-    cc.set_cache_dir('/nfs/jax-cache')
+    cc.set_cache_dir('/home/kvfrans/jax-cache')
     from localutils.debugger import enable_debug
     enable_debug()
 except:
@@ -23,7 +23,7 @@ from lmpo.models.qwen3 import create_model_from_ckpt
 from lmpo.utils.configs import define_flag_dict
 from lmpo.utils.wandb import setup_wandb
 from lmpo.envs.env_creator import create_env
-from lmpo.utils.sharding import create_sharding, host_gather
+from lmpo.utils.sharding import create_sharding, host_gather, get_memory_usage, get_local_slice
 from lmpo.utils.train_state import TrainState
 from lmpo.models.tokenizer import create_tokenizer
 from lmpo.utils.checkpoint import Checkpoint
@@ -34,7 +34,7 @@ config = ml_collections.ConfigDict({
     'wandb_project': "lmpo",
     'wandb_name': 'lmpo-run',
     'wandb_group': 'Default',
-    'model_dir': '/nfs/gcs/jaxconverted/Qwen3-1.7B/',
+    'model_dir': '/gcs/jaxconverted/Qwen3-1.7B/',
     'save_dir': "",
     'save_interval': 20,
     # env settings.
@@ -45,17 +45,24 @@ config = ml_collections.ConfigDict({
     'test_env_name': '',
     'test_interval': 10,
     # sampling settings.
-    'inference_batch_per_device': 4, # Set this to the maximum until OOM. Should not affect results.
+    'prefill_batch_split': 4,
+    'inference_batch_per_device': 64, # Set this to the maximum until OOM. Should not affect results.
     # training settings.
-    'groups_per_batch': 64, # global batch = groups_per_batch * group_size
+    'groups_per_batch': 256, # global batch = groups_per_batch * group_size
     'ppo_minibatch': 64,
     'group_size': 8, # GRPO group size.
     'do_group_normalization': 1,
     'do_global_normalization': 0,
     'do_group_filter': 1, # Filter for groups with all advantages == 0.
+    'do_clip_advantages': 0, # Clip advantages to be positive.
+    'do_inference_logprobs': 0, # Use inference-time logprobs for importance sampling ratio.
+    'do_mask_inference_ratio': 0, # Mask out tokens with a bad inference/recompute ratio.
     'lr': 1e-6,
     'clip_epsilon': 0.2,
+    'do_ppo_all_clip': 0, # Clips both sides of ratio.
     'entropy_coef': 0.001,
+    'kl_coef': 0.001,
+    'weight_decay': 1e-2,
 })
 define_flag_dict(config)
 FLAGS = flags.FLAGS
@@ -70,13 +77,15 @@ ckpt_dir = FLAGS.model_dir
 model, params = create_model_from_ckpt(ckpt_dir)
 tx = optax.chain(
     optax.clip_by_global_norm(1.0),
-    optax.adamw(FLAGS.lr, b1=0.9, b2=0.95, weight_decay=1e-2)
+    optax.adamw(FLAGS.lr, b1=0.9, b2=0.95, weight_decay=FLAGS.weight_decay),
 )
 rng = jax.random.PRNGKey(0)
+print("Memory usage pre-init:", get_memory_usage(), "GB")
 init_fn = partial(TrainState.create_with_params, model_def=model, tx=tx, use_ema=False)
 train_state_shape = jax.eval_shape(init_fn, rng=rng, params=params)
 train_state_shard, no_shard, data_shard, shard_data_fn = create_sharding('fsdp', train_state_shape)
 train_state = jax.jit(lambda r, p: init_fn(rng=r, params=p), out_shardings=train_state_shard)(rng, params)
+print("Memory usage train_state:", get_memory_usage(), "GB")
 
 jax.debug.visualize_array_sharding(train_state.params['Block_0']['Dense_0']['kernel'])
 tokenizer = create_tokenizer(ckpt_dir)
@@ -105,23 +114,34 @@ def get_logprobs(train_state: TrainState, token_batch, mask):
     return logprobs
 
 @partial(jax.jit, out_shardings=(train_state_shard, None))
-def update(train_state: TrainState, token_batch, mask, advantages, old_logprobs):
+def update(train_state: TrainState, token_batch, mask_origin, advantages, recalc_logprobs, inference_logprobs):
     print("JIT compiling update function for token_batch of shape", token_batch.shape)
     text_input, text_target = token_batch[:, :-1], token_batch[:, 1:]
-    mask = mask[:, 1:]
+    inference_logprobs = inference_logprobs[:, 1:]
+    mask_origin = mask_origin[:, 1:]
+    is_max_tokens = (mask_origin[:, -1] == True)
     token_mask = jnp.where(text_input != pad_id, 1, 0).astype(jnp.int32)
     def loss_fn(grad_params):
         logits, _ = train_state.call_model(text_input, token_mask, cache=None, params=grad_params)
-        logprobs = jax.nn.log_softmax(logits) # [batch, time, vocab_size]
-        token_logprobs = jnp.sum(logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
-        entropy = -jnp.sum(jax.nn.softmax(logits) * logprobs, axis=-1)
+        all_logprobs = jax.nn.log_softmax(logits) # [batch, time, vocab_size]
+        token_logprobs = jnp.sum(all_logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
+        entropy = -jnp.sum(jax.nn.softmax(logits) * all_logprobs, axis=-1)
+
+        old_logprobs = inference_logprobs if FLAGS.do_inference_logprobs else recalc_logprobs
+        ratio_recompute_inference = jnp.exp(inference_logprobs - recalc_logprobs)
+        mask = mask_origin
+        if FLAGS.do_mask_inference_ratio:
+            mask = mask * (jnp.abs(ratio_recompute_inference) - 1 < 1.0)
 
         # PPO loss.
         logratio = token_logprobs - old_logprobs
         ratio = jnp.exp(logratio)
-        pg_loss1 = -advantages[:, None] * ratio
-        pg_loss2 = -advantages[:, None] * jnp.clip(ratio, 1 - FLAGS.clip_epsilon, 1 + FLAGS.clip_epsilon)
-        pg_loss = jnp.maximum(pg_loss1, pg_loss2)
+        if FLAGS.do_ppo_all_clip:
+            pg_loss = -advantages[:, None] * jnp.clip(ratio, 1 - FLAGS.clip_epsilon, 1 + FLAGS.clip_epsilon)
+        else:
+            pg_loss1 = -advantages[:, None] * ratio
+            pg_loss2 = -advantages[:, None] * jnp.clip(ratio, 1 - FLAGS.clip_epsilon, 1 + FLAGS.clip_epsilon)
+            pg_loss = jnp.maximum(pg_loss1, pg_loss2)
 
         # Metrics
         avg_over_mask = lambda x : jnp.sum(x * mask) / jnp.sum(mask)
@@ -130,7 +150,9 @@ def update(train_state: TrainState, token_batch, mask, advantages, old_logprobs)
         approx_kl = avg_over_mask((ratio - 1) - logratio)
         entropy_avg = avg_over_mask(entropy)
         clip_fracs = avg_over_mask(jnp.abs(ratio - 1.0) > FLAGS.clip_epsilon)
-        cross_entropy = avg_over_mask(-token_logprobs)
+        logprob_of_token = avg_over_mask(-token_logprobs)
+        inference_recompute_kl = avg_over_mask((ratio_recompute_inference - 1) - (inference_logprobs - recalc_logprobs))
+        inference_recompute_prob_diff = jnp.abs(jnp.exp(inference_logprobs) - jnp.exp(recalc_logprobs)) * mask
 
         loss_pg = jnp.mean(pg_loss * mask)
         loss_ent = -jnp.mean(entropy_avg * mask) * FLAGS.entropy_coef
@@ -142,16 +164,21 @@ def update(train_state: TrainState, token_batch, mask, advantages, old_logprobs)
             'advantages': jnp.mean(advantages),
             'advantages_magnitude': jnp.mean(jnp.abs(advantages)),
             'nonzero_advantages': jnp.mean(advantages != 0),
-            'entropy_per_token': entropy_avg,
+            'entropy': entropy_avg,
             'approx_kl': approx_kl,
+            'inference_recompute/kl': inference_recompute_kl,
+            'inference_recompute/prob_diff_mean': jnp.mean(inference_recompute_prob_diff),
+            'inference_recompute/prob_diff_99quantile': jnp.quantile(inference_recompute_prob_diff, 0.99),
+            'inference_recompute/prob_diff_max': jnp.max(inference_recompute_prob_diff),
             'clip_fraction': clip_fracs,
-            'cross_entropy': cross_entropy,
-            'importance_ratio': importance_ratio,
-            'importance_ratio_magnitude': importance_ratio_mag,
-            'importrance_ratio_max': jnp.max(ratio * mask),
-            'importrance_ratio_min': jnp.min(ratio * mask),
+            'logprob_of_token': logprob_of_token,
+            'importance_ratio/mean': importance_ratio,
+            'importance_ratio/magnitude': importance_ratio_mag,
+            'importance_ratio/99quantile': jnp.quantile(ratio * mask, 0.99),
+            'importance_ratio/max': jnp.max(ratio * mask),
+            'importance_ratio/min': jnp.min(ratio * mask),
             'trained_tokens_per_seq': jnp.mean(jnp.sum(mask, axis=-1)),
-            'is_max_tokens': jnp.mean(mask[:, -1] == True),
+            'is_max_tokens': jnp.mean(is_max_tokens),
         }
     grads, info = jax.grad(loss_fn, has_aux=True)(train_state.params)
     updates, opt_state = train_state.tx.update(grads, train_state.opt_state, train_state.params)
@@ -175,7 +202,7 @@ for i in tqdm.tqdm(range(10000)):
 
     # Fill this global on-policy buffer with groups that have A != 0.
     buffer_tokens = []
-    buffer_logprobs = []
+    buffer_inference_logprobs = []
     buffer_advantages = []
     env_infos_history = {}
     env_infos_history['return'] = []
@@ -197,15 +224,17 @@ for i in tqdm.tqdm(range(10000)):
         prompt_tokens = shard_data_fn(prompt_tokens)
         num_generation_tokens = FLAGS.num_generation_tokens
         rng, key = jax.random.split(rng)
-        action_tokens = autoregressive_sample(
+        action_tokens, action_logprobs = autoregressive_sample(
             train_state.model_def, train_state.params, prompt_tokens, rng=key, num_generation_tokens=num_generation_tokens, 
-            pad_id=pad_id, data_shard=data_shard, no_shard=no_shard, force_answer_at=FLAGS.force_answer_at,
+            pad_id=pad_id, data_shard=data_shard, no_shard=no_shard, force_answer_at=FLAGS.force_answer_at, 
+            prefill_batch_split=FLAGS.prefill_batch_split, return_logprobs=True
         )
         prompt_tokens = host_gather(prompt_tokens)
         action_tokens = host_gather(action_tokens)
         all_tokens = jnp.concatenate([prompt_tokens, action_tokens], axis=-1)
+        all_logprobs = jnp.concatenate([jnp.zeros_like(prompt_tokens), action_logprobs], axis=-1)
 
-        action_tokens_local = action_tokens[host_id * rollout_batch_size : (host_id+1) * rollout_batch_size]
+        action_tokens_local = get_local_slice(action_tokens, data_shard.mesh)
         new_states, _, returns_local, dones, env_infos = env.step_list(env_states, [t.tolist() for t in action_tokens_local])
         assert dones[0] # Only supports bandit envs for now.
         returns_local = np.array(returns_local)
@@ -231,8 +260,11 @@ for i in tqdm.tqdm(range(10000)):
             global_mean = np.mean(advantages)
             global_std = np.std(advantages) + 1e-8
             advantages = (advantages - global_mean) / global_std
+        if FLAGS.do_clip_advantages:
+            advantages = np.clip(advantages, a_min=0, a_max=None)
         advantages_grouped = advantages # [batch_size // group_size, group_size]
         all_tokens_grouped = all_tokens.reshape(-1, FLAGS.group_size, all_tokens.shape[-1])
+        all_logprobs_grouped = all_logprobs.reshape(-1, FLAGS.group_size, all_logprobs.shape[-1])
 
         for group_idx in range(advantages_grouped.shape[0]):
             if np.all(advantages_grouped[group_idx, :] == 0) and FLAGS.do_group_filter:
@@ -240,6 +272,7 @@ for i in tqdm.tqdm(range(10000)):
             else:
                 buffer_tokens.append(all_tokens_grouped[group_idx, :])
                 buffer_advantages.append(advantages_grouped[group_idx, :])
+                buffer_inference_logprobs.append(all_logprobs_grouped[group_idx, :])
         print(f"Buffer size: {len(buffer_tokens) * FLAGS.group_size}. Return avg: {np.mean(returns)}")
         if jax.process_index() == 0:
             print(env.render(new_states[0]))
@@ -258,9 +291,12 @@ for i in tqdm.tqdm(range(10000)):
     # The buffer is syncronized among hosts.
     tokens_all = jnp.concatenate(buffer_tokens, axis=0)
     advantages = jnp.concatenate(buffer_advantages, axis=0)
+    inference_logprobs_all = jnp.concatenate(buffer_inference_logprobs, axis=0)
     global_batch_size = FLAGS.groups_per_batch * FLAGS.group_size
+    print(f"Clipping total buffer of {tokens_all.shape[0]} to global batch size {global_batch_size}.")
     tokens_all = tokens_all[:global_batch_size]
     advantages = advantages[:global_batch_size]
+    inference_logprobs_all = inference_logprobs_all[:global_batch_size]
 
     # Mask = False for all prompt tokens, and tokens after <|im_end|> token.
     mask = (jnp.arange(tokens_all.shape[-1]) >= mask_size - 1)[None, :]
@@ -270,6 +306,7 @@ for i in tqdm.tqdm(range(10000)):
 
     tokens_all_minibatch = ppo_shard(tokens_all)
     advantages_minibatch = ppo_shard(advantages)
+    inference_logprobs_all_minibatch = ppo_shard(inference_logprobs_all)
     mask_minibatch = ppo_shard(mask)
 
     # First, we do a forward pass to get prior logprobs for each token.
@@ -280,8 +317,10 @@ for i in tqdm.tqdm(range(10000)):
     logprobs_all_minibatch = jnp.stack(logprobs_list, axis=1)
 
     # Then, the training loop.
+    update_time_start = time.time()
     for j in range(global_batch_size // FLAGS.ppo_minibatch):
-        train_state, info = update(train_state, tokens_all_minibatch[:, j], mask_minibatch[:, j], advantages_minibatch[:, j], logprobs_all_minibatch[:, j])
+        train_state, info = update(train_state, tokens_all_minibatch[:, j], mask_minibatch[:, j], advantages_minibatch[:, j], 
+                                   logprobs_all_minibatch[:, j], inference_logprobs_all_minibatch[:, j])
         info = jax.device_get(info)
         info['output_tokens'] = eos_idx
         info = jax.tree.map(lambda x: np.array(x), info)
@@ -291,17 +330,22 @@ for i in tqdm.tqdm(range(10000)):
             info['env_epochs'] = total_rollouts / env_num_tasks
         info['rollout_iters_per_update'] = num_rollout_iters
         info['global_step'] = i
-        info['time_per_inference_iteration'] = rollout_total_time / num_rollout_iters
-        info['time_per_rollout'] = rollout_total_time / (num_rollout_iters * rollout_batch_size * jax.host_count())
-        info['time_per_effective_rollout'] = rollout_total_time / global_batch_size
+        info['times/time_per_inference_iteration'] = rollout_total_time / num_rollout_iters
+        info['times/time_per_rollout'] = rollout_total_time / (num_rollout_iters * rollout_batch_size * jax.host_count())
+        info['times/time_per_effective_rollout'] = rollout_total_time / global_batch_size
+        info['times/total_time_rollouts'] = rollout_total_time
+        info['times/total_time_update'] = time.time() - update_time_start
         info['effective_rollout_ratio'] = global_batch_size / (rollout_batch_size * jax.host_count() * num_rollout_iters)
         info['minibatches_per_global_step'] = global_batch_size // FLAGS.ppo_minibatch
         for k, v in env_infos_history.items():
             info['env/'+k] = np.mean(v)
+        if 'action_length' in env_infos_history:
+            info['env/is_max_tokens'] = np.mean(np.array(env_infos_history['action_length']) >= env.tokens_per_action)
         if jax.process_index() == 0:
             rollouts_list.append([i, env.render(new_states[0]), returns_local[0]])
-            rollouts_table = wandb.Table(data=rollouts_list, columns=["step", "text", "reward"])
-            info['rollouts_table'] = rollouts_table
+            if i % 100 == 0 and j == 0:
+                rollouts_table = wandb.Table(data=rollouts_list, columns=["step", "text", "reward"])
+                info['rollouts_table'] = rollouts_table
             if j == global_batch_size // FLAGS.ppo_minibatch - 1:
                 print(f'=================== Iter {i} ===================')
                 for k, v in info.items():

@@ -9,7 +9,7 @@ from absl import app, flags
 from lmpo.models.qwen3 import create_model_from_ckpt
 from lmpo.utils.configs import define_flag_dict
 from lmpo.envs.env_creator import create_env
-from lmpo.utils.sharding import create_sharding, host_gather
+from lmpo.utils.sharding import create_sharding, host_gather, get_local_slice
 from lmpo.models.tokenizer import create_tokenizer
 from lmpo.core.sampling import pad_and_collate, autoregressive_sample
 
@@ -26,7 +26,7 @@ def eval_model(model, params, env,
                ):
     np.random.seed(jax.process_index())
     host_id = jax.process_index()
-    env_num_tasks = env.num_tasks if env.num_tasks != -1 else 100
+    env_num_tasks = env.num_tasks if env.num_tasks != -1 else 512
     total_num_tasks = num_epochs * env_num_tasks
     env_task_idx = 0
     rollout_batch_size = jax.local_device_count() * inference_batch_per_device
@@ -54,7 +54,7 @@ def eval_model(model, params, env,
         )
         prompt_tokens = host_gather(prompt_tokens)
         action_tokens = host_gather(action_tokens)
-        action_tokens_local = action_tokens[host_id * rollout_batch_size : (host_id+1) * rollout_batch_size]
+        action_tokens_local = get_local_slice(action_tokens, data_shard.mesh)
         new_states, _, returns_local, dones, env_infos = env.step_list(env_states, [t.tolist() for t in action_tokens_local])
         assert dones[0] # Only supports bandit envs for now.
         returns_local = np.array(returns_local)
@@ -76,7 +76,7 @@ def eval_model(model, params, env,
 ##################################################
 if __name__ == '__main__':
     config = ml_collections.ConfigDict({
-        'model_dir': '/nfs/gcs/jaxconverted/Qwen3-1.7B/',
+        'model_dir': '/gcs/jaxconverted/Qwen3-1.7B/',
         # env settings.
         'env_name': 'poem',
         'num_generation_tokens': -1, # -1 = use default from env.
