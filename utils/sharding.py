@@ -69,3 +69,17 @@ def create_sharding(shard_type, train_state_shape=None):
 def host_gather(x):
     is_multi_host = len(jax.local_devices()) != len(jax.devices())
     return jax.experimental.multihost_utils.process_allgather(x) if is_multi_host else x
+
+def get_local_slice(x, mesh):
+    local_devices = [d.id for d in mesh.local_devices]
+    global_devices = [d.id for d in mesh.devices]
+    device_slice = x.shape[0] // len(mesh.devices)
+    local_shards = []
+    for d in local_devices:
+        device_idx = global_devices.index(d)
+        local_shards.append(x[device_idx * device_slice:(device_idx + 1) * device_slice])
+    return jnp.concatenate(local_shards, axis=0)
+
+def get_memory_usage():
+    stats = jax.local_devices()[0].memory_stats()
+    return stats['bytes_in_use'] / (1024**3)

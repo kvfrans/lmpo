@@ -14,7 +14,7 @@ class PoemLengthEnv(BaseEnv):
         self.tokenizer = tokenizer
 
     def reset(self, idx):
-        imagenet_labels = open('inference/imagenet_labels.txt').read().splitlines()
+        imagenet_labels = open('data/imagenet_labels.txt').read().splitlines()
         msg = f'Write three sentences about {imagenet_labels[idx % 1000]}'
         output_tokens = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": msg}],
