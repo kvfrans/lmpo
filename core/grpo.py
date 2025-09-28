@@ -57,6 +57,7 @@ config = ml_collections.ConfigDict({
     'do_clip_advantages': 0, # Clip advantages to be positive.
     'do_inference_logprobs': 0, # Use inference-time logprobs for importance sampling ratio.
     'do_mask_inference_ratio': 0, # Mask out tokens with a bad inference/recompute ratio.
+    'do_mask_importance_ratio': 0, # Mask out tokens with a bad importance ratio.
     'lr': 1e-6,
     'clip_epsilon': 0.2,
     'do_ppo_all_clip': 0, # Clips both sides of ratio.
@@ -129,9 +130,6 @@ def update(train_state: TrainState, token_batch, mask_origin, advantages, recalc
 
         old_logprobs = inference_logprobs if FLAGS.do_inference_logprobs else recalc_logprobs
         ratio_recompute_inference = jnp.exp(inference_logprobs - recalc_logprobs)
-        mask = mask_origin
-        if FLAGS.do_mask_inference_ratio:
-            mask = mask * (jnp.abs(ratio_recompute_inference) - 1 < 1.0)
 
         # PPO loss.
         logratio = token_logprobs - old_logprobs
@@ -142,6 +140,12 @@ def update(train_state: TrainState, token_batch, mask_origin, advantages, recalc
             pg_loss1 = -advantages[:, None] * ratio
             pg_loss2 = -advantages[:, None] * jnp.clip(ratio, 1 - FLAGS.clip_epsilon, 1 + FLAGS.clip_epsilon)
             pg_loss = jnp.maximum(pg_loss1, pg_loss2)
+
+        mask = mask_origin
+        if FLAGS.do_mask_inference_ratio:
+            mask = mask * (jnp.abs(ratio_recompute_inference) - 1 < 1.0)
+        if FLAGS.do_mask_importance_ratio:
+            mask = mask * (jnp.abs(ratio) - 1 < 1.0)
 
         # Metrics
         avg_over_mask = lambda x : jnp.sum(x * mask) / jnp.sum(mask)
@@ -246,7 +250,6 @@ for i in tqdm.tqdm(range(10000)):
             env_infos_history[k] += v_global.tolist()
         env_infos_history['return'] += returns.tolist()
 
-
         mask_size = prompt_tokens.shape[-1]
 
         # Advantage calculation.
@@ -339,8 +342,6 @@ for i in tqdm.tqdm(range(10000)):
         info['minibatches_per_global_step'] = global_batch_size // FLAGS.ppo_minibatch
         for k, v in env_infos_history.items():
             info['env/'+k] = np.mean(v)
-        if 'action_length' in env_infos_history:
-            info['env/is_max_tokens'] = np.mean(np.array(env_infos_history['action_length']) >= env.tokens_per_action)
         if jax.process_index() == 0:
             rollouts_list.append([i, env.render(new_states[0]), returns_local[0]])
             if i % 100 == 0 and j == 0:

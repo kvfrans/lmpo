@@ -166,6 +166,7 @@ class Qwen3Model(nn.Module):
     num_layers: int
     rope_theta: int
     eps: float = 1e-6
+    use_v_head: bool = False
 
     @nn.compact
     def __call__(self, x, token_mask, cache = None, get_logits=True):
@@ -187,10 +188,13 @@ class Qwen3Model(nn.Module):
 
         gamma_final = self.param('gamma_final', nn.initializers.constant(1.0), (self.hidden_size,))
         x = rms_norm(x, gamma_final, self.eps)
-        if get_logits:
-            logits = nn.Dense(self.vocab_size, use_bias=False)(x)
+        if not self.use_v_head:
+            if get_logits:
+                logits = nn.Dense(self.vocab_size, use_bias=False)(x)
+            else:
+                logits = None
         else:
-            logits = None
+            logits = nn.Dense(1, use_bias=False)(x) # V-prediction head.
 
         if cache is not None:
             cache = cache.replace(length=cache.length + jnp.max(length_minus_padding(token_mask)))
@@ -275,7 +279,7 @@ def create_model_from_hf(hf_dir: str):
     
     return model, params
 
-def create_model_from_ckpt(ckpt_dir: str):
+def create_model_from_ckpt(ckpt_dir: str, use_v_head: bool = False):
     from lmpo.utils.checkpoint import Checkpoint
     with open(ckpt_dir + "config.json") as f:
         cfg = json.load(f)
@@ -288,7 +292,8 @@ def create_model_from_ckpt(ckpt_dir: str):
         vocab_size=cfg['vocab_size'],
         mlp_ffw_size=cfg['intermediate_size'],
         eps=cfg['rms_norm_eps'],
-        rope_theta=cfg['rope_theta']
+        rope_theta=cfg['rope_theta'],
+        use_v_head=use_v_head,
     )
     ckpt = Checkpoint(ckpt_dir + "params.pkl", parallel=False)
     params = ckpt.load_as_dict()['params']

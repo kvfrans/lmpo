@@ -124,3 +124,4 @@ if __name__ == '__main__':
     print("Number of rollouts:", len(env_infos_history['return']))
     for k, v in env_infos_history.items():
         print(f"{k}: {np.mean(v)}")
+    breakpoint()

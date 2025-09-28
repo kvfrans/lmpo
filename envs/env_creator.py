@@ -11,6 +11,9 @@ def create_env(env_name, tokenizer):
     elif env_name == 'countdown':
         from lmpo.envs.countdown import CountdownEnv
         env = CountdownEnv(tokenizer)
+    elif env_name == 'countdown6':
+        from lmpo.envs.countdown import CountdownEnvSix
+        env = CountdownEnvSix(tokenizer)
     elif env_name == 'deepscaler':
         from lmpo.envs.deepscaler import DeepscalerEnv
         env = DeepscalerEnv(tokenizer)

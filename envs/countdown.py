@@ -93,9 +93,7 @@ def generate_candidate_expression(num_terms, rng):
 
     return expr, numbers, syms
 
-def generate_expression(rng):
-    num_terms = 4
-
+def generate_expression(rng, num_terms=4):
     max_attempts = 100
     for attempt in range(max_attempts):
         try:
@@ -124,15 +122,16 @@ class CountdownEnv(BaseEnv):
         super().__init__() 
         self.tokens_per_action = 1024
         self.force_answer_at = 50
+        self.num_terms = 4
         self.data_dict = {}
         self.tokenizer = tokenizer
 
     def reset(self, idx):
         rng = np.random.RandomState(idx)
-        _, numbers, target = generate_expression(rng)
+        _, numbers, target = generate_expression(rng, self.num_terms)
         rng.shuffle(numbers)
         output_tokens = self.tokenizer.apply_chat_template([
-                {'role': 'system', 'content': SYSTEM_PROMPT},
+                {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": USER_PROMPT.format(target=target, numbers=numbers)},
             ],
             add_generation_prompt=True,
@@ -147,6 +146,7 @@ class CountdownEnv(BaseEnv):
     def step(self, state, action_tokens):
         action_tokens = self.clean_action(action_tokens, self.tokenizer.get_eos_token_id())
         action_msg = self.tokenizer.decode(action_tokens)
+        is_max_tokens = len(action_tokens) >= self.tokens_per_action
         equation = extract_xml_answer(action_msg)
         reward = 0.0
         evaluated_answer = None
@@ -156,6 +156,8 @@ class CountdownEnv(BaseEnv):
             if evaluated_answer is not None:
                 if abs(evaluated_answer - state.correct_answer) < 1e-6:
                     reward = 1.0
+            if is_max_tokens:
+                reward -= 0.05
 
         render_str = [
             f"{self.tokenizer.decode(state.tokens + action_tokens)}",
@@ -170,4 +172,10 @@ class CountdownEnv(BaseEnv):
             'valid_equation': reward > 0.0,
             'correct_answer': reward >= 1.0,
             'action_length': len(action_tokens),
+            'is_max_tokens': is_max_tokens,
         }
+
+class CountdownEnvSix(CountdownEnv):
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+        self.num_terms = 6

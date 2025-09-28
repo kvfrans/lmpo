@@ -14,7 +14,7 @@ def pad_and_collate(token_batch: list, pad_id: int = 0, force_length: int = None
     if force_length is not None:
         if max_len > force_length:
             token_batch = [x[:force_length] for x in token_batch]
-            print("Warning: Prompt tokens too long, truncating.")
+            print(f"Warning: Prompt tokens too long, truncating. Empiricl max {max_len}, truncated to {force_length}")
         max_len = force_length
     return np.array([(max_len - len(x)) * [pad_id] + x for x in token_batch])
 
