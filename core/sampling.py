@@ -4,6 +4,7 @@ import numpy as np
 import jax
 from functools import partial
 import time
+import tqdm
 
 from lmpo.utils.sharding import host_gather, get_memory_usage
 from lmpo.models.qwen3 import Qwen3Model, KVCache, count_left_padding
@@ -33,6 +34,7 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
     max_seq_len = prompt_tokens.shape[1] + num_generation_tokens
 
     cache_sharding = KVCache.get_sharding(data_shard, no_shard)
+    params = jax.jit(lambda x: x, out_shardings=no_shard)(params)
 
     if model_apply_prefill is None:
         @partial(jax.jit, out_shardings=cache_sharding)
@@ -88,7 +90,7 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
     logprobs_list = []
 
     max_samples = max_seq_len - prompt_tokens.shape[-1]
-    for i in range(max_samples):
+    for i in tqdm.tqdm(range(max_samples)):
         next_token_mask = jnp.ones(sampled_token.shape, dtype=jnp.int32)
         key, rng = jax.random.split(rng)
 

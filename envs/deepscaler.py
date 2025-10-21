@@ -40,7 +40,7 @@ class DeepscalerEnv(BaseEnv):
         self.data_dict = {}
         self.tokenizer = tokenizer
         from datasets import load_dataset
-        self.ds = load_dataset('agentica-org/DeepScaleR-Preview-Dataset')['train']
+        self.ds = load_dataset('agentica-org/DeepScaleR-Preview-Dataset')['train'].shuffle(seed=42)
         self.num_tasks = len(self.ds)
 
     def reset(self, idx):
