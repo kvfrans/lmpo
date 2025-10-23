@@ -21,7 +21,7 @@ def pad_and_collate(token_batch: list, pad_id: int = 0, force_length: int = None
 
 model_apply_prefill = None # Global variable to cache the JIT-compiled model application function.
 model_apply_generate = None
-def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generation_tokens, rng, temp=1, pad_id=0, data_shard=None, no_shard=None, prefill_batch_split=4, force_answer_at=-1, return_logprobs=False):
+def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generation_tokens, rng, temp=1, pad_id=0, data_shard=None, no_shard=None, params_shard=None, prefill_batch_split=4, force_answer_at=-1, return_logprobs=False):
     """
     Samples tokens autoregressively, and can batch for performance.
     Args:
@@ -34,7 +34,8 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
     max_seq_len = prompt_tokens.shape[1] + num_generation_tokens
 
     cache_sharding = KVCache.get_sharding(data_shard, no_shard)
-    params = jax.jit(lambda x: x, out_shardings=no_shard)(params)
+    if params_shard is not None:
+        params = jax.device_put(params, params_shard)
 
     if model_apply_prefill is None:
         @partial(jax.jit, out_shardings=cache_sharding)

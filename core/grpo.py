@@ -64,6 +64,7 @@ config = ml_collections.ConfigDict({
     'entropy_coef': 0.001,
     'kl_coef': 0.001,
     'weight_decay': 1e-2,
+    'sharding': 'tfsdp',
 })
 define_flag_dict(config)
 FLAGS = flags.FLAGS
@@ -84,8 +85,9 @@ rng = jax.random.PRNGKey(0)
 print("Memory usage pre-init:", get_memory_usage(), "GB")
 init_fn = partial(TrainState.create_with_params, model_def=model, tx=tx, use_ema=False)
 train_state_shape = jax.eval_shape(init_fn, rng=rng, params=params)
-train_state_shard, no_shard, data_shard, shard_data_fn = create_sharding('fsdp', train_state_shape)
+train_state_shard, no_shard, data_shard, data_shard_dp, shard_data_fn  = create_sharding(FLAGS.sharding, train_state_shape)
 train_state = jax.jit(lambda r, p: init_fn(rng=r, params=p), out_shardings=train_state_shard)(rng, params)
+del params
 print("Memory usage train_state:", get_memory_usage(), "GB")
 
 jax.debug.visualize_array_sharding(train_state.params['Block_0']['Dense_0']['kernel'])
@@ -225,12 +227,12 @@ for i in tqdm.tqdm(range(10000)):
                 env_tokens.append(output_tokens)
 
         prompt_tokens = pad_and_collate(env_tokens, pad_id=pad_id, force_length=FLAGS.prompt_length)
-        prompt_tokens = shard_data_fn(prompt_tokens)
+        prompt_tokens = shard_data_fn(prompt_tokens, sharding=data_shard_dp)
         num_generation_tokens = FLAGS.num_generation_tokens
         rng, key = jax.random.split(rng)
         action_tokens, action_logprobs = autoregressive_sample(
             train_state.model_def, train_state.params, prompt_tokens, rng=key, num_generation_tokens=num_generation_tokens, 
-            pad_id=pad_id, data_shard=data_shard, no_shard=no_shard, force_answer_at=FLAGS.force_answer_at, 
+            pad_id=pad_id, data_shard=data_shard_dp, no_shard=no_shard, params_shard=no_shard, force_answer_at=FLAGS.force_answer_at, 
             prefill_batch_split=FLAGS.prefill_batch_split, return_logprobs=True
         )
         prompt_tokens = host_gather(prompt_tokens)
@@ -238,15 +240,15 @@ for i in tqdm.tqdm(range(10000)):
         all_tokens = jnp.concatenate([prompt_tokens, action_tokens], axis=-1)
         all_logprobs = jnp.concatenate([jnp.zeros_like(prompt_tokens), action_logprobs], axis=-1)
 
-        action_tokens_local = get_local_slice(action_tokens, data_shard.mesh)
+        action_tokens_local = get_local_slice(action_tokens, data_shard_dp.mesh)
         new_states, _, returns_local, dones, env_infos = env.step_list(env_states, [t.tolist() for t in action_tokens_local])
         assert dones[0] # Only supports bandit envs for now.
         returns_local = np.array(returns_local)
-        returns = host_gather(shard_data_fn(returns_local))
+        returns = host_gather(shard_data_fn(returns_local, sharding=data_shard_dp))
         for k, v in env_infos.items():
             if k not in env_infos_history:
                 env_infos_history[k] = []
-            v_global = host_gather(shard_data_fn(np.array(v)))
+            v_global = host_gather(shard_data_fn(np.array(v), sharding=data_shard_dp))
             env_infos_history[k] += v_global.tolist()
         env_infos_history['return'] += returns.tolist()
 
