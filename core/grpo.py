@@ -58,13 +58,18 @@ config = ml_collections.ConfigDict({
     'do_inference_logprobs': 0, # Use inference-time logprobs for importance sampling ratio.
     'do_mask_inference_ratio': 0, # Mask out tokens with a bad inference/recompute ratio.
     'do_mask_importance_ratio': 0, # Mask out tokens with a bad importance ratio.
+    'negative_advantage_multiplier': 1.0,
     'lr': 1e-6,
     'clip_epsilon': 0.2,
     'do_ppo_all_clip': 0, # Clips both sides of ratio.
     'entropy_coef': 0.001,
     'kl_coef': 0.001,
     'weight_decay': 1e-2,
+    # Non-training settings.
     'sharding': 'tfsdp',
+    # For offline data collection.
+    'do_save_rollouts': 0,
+    'save_rollouts_dir': 'rollouts/',
 })
 define_flag_dict(config)
 FLAGS = flags.FLAGS
@@ -105,6 +110,15 @@ np.random.seed(jax.process_index())
 env_num_tasks = env.num_tasks if env.num_tasks != -1 else 1000000
 env_task_idx = 0
 
+if FLAGS.do_save_rollouts:
+    rollouts_buffer_returns = []
+    rollouts_buffer_prompts = []
+    rollouts_buffer_actions = []
+    rollouts_buffer_iter = 0
+    import os
+    if jax.process_index() == 0:
+        os.makedirs(FLAGS.save_rollouts_dir, exist_ok=True)
+
 @jax.jit
 def get_logprobs(train_state: TrainState, token_batch, mask):
     print("JIT compiling logprob function for token_batch of shape", token_batch.shape)
@@ -117,7 +131,7 @@ def get_logprobs(train_state: TrainState, token_batch, mask):
     return logprobs
 
 @partial(jax.jit, out_shardings=(train_state_shard, None))
-def update(train_state: TrainState, token_batch, mask_origin, advantages, recalc_logprobs, inference_logprobs):
+def update(train_state: TrainState, token_batch, mask_origin, advantages_in, recalc_logprobs, inference_logprobs):
     print("JIT compiling update function for token_batch of shape", token_batch.shape)
     text_input, text_target = token_batch[:, :-1], token_batch[:, 1:]
     inference_logprobs = inference_logprobs[:, 1:]
@@ -132,6 +146,13 @@ def update(train_state: TrainState, token_batch, mask_origin, advantages, recalc
 
         old_logprobs = inference_logprobs if FLAGS.do_inference_logprobs else recalc_logprobs
         ratio_recompute_inference = jnp.exp(inference_logprobs - recalc_logprobs)
+
+        if FLAGS.negative_advantage_multiplier != 1.0:
+            advantages = jnp.where(
+                advantages_in < 0, advantages_in * FLAGS.negative_advantage_multiplier, advantages_in
+            )
+        else:
+            advantages = advantages_in
 
         # PPO loss.
         logratio = token_logprobs - old_logprobs
@@ -159,7 +180,6 @@ def update(train_state: TrainState, token_batch, mask_origin, advantages, recalc
         logprob_of_token = avg_over_mask(-token_logprobs)
         inference_recompute_kl = avg_over_mask((ratio_recompute_inference - 1) - (inference_logprobs - recalc_logprobs))
         inference_recompute_prob_diff = jnp.abs(jnp.exp(inference_logprobs) - jnp.exp(recalc_logprobs)) * mask
-
         loss_pg = jnp.mean(pg_loss * mask)
         loss_ent = -jnp.mean(entropy_avg * mask) * FLAGS.entropy_coef
         loss = loss_pg + loss_ent
@@ -254,6 +274,21 @@ for i in tqdm.tqdm(range(10000)):
 
         mask_size = prompt_tokens.shape[-1]
 
+        if FLAGS.do_save_rollouts and jax.process_index() == 0:
+            rollouts_buffer_prompts.append(np.array(prompt_tokens))
+            rollouts_buffer_actions.append(np.array(action_tokens))
+            rollouts_buffer_returns.append(np.array(returns))
+            if len(rollouts_buffer_prompts) > 100:
+                print("Saving rollouts buffer to disk...")
+                np.savez_compressed(FLAGS.save_dir + f'{FLAGS.save_rollouts_dir}/rollouts_buffer_{rollouts_buffer_iter}.npz',
+                                    prompts=np.concatenate(rollouts_buffer_prompts, axis=0),
+                                    actions=np.concatenate(rollouts_buffer_actions, axis=0),
+                                    returns=np.concatenate(rollouts_buffer_returns, axis=0))
+                rollouts_buffer_prompts = []
+                rollouts_buffer_actions = []
+                rollouts_buffer_returns = []
+                rollouts_buffer_iter += 1
+
         # Advantage calculation.
         returns = jnp.reshape(returns, (-1, FLAGS.group_size))
         advantages = returns
@@ -289,7 +324,6 @@ for i in tqdm.tqdm(range(10000)):
         host_id = jax.process_index()
         host_slice = FLAGS.ppo_minibatch // jax.process_count()
         x = jnp.reshape(x, (FLAGS.ppo_minibatch, -1, *x.shape[1:]))
-        x = x[host_id * host_slice : (host_id + 1) * host_slice, :]
         x = shard_data_fn(x)
         return x # [ppo_minibatch, num_minibatches (j), ...] where first dim is sharded.
 

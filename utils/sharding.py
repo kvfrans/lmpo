@@ -10,7 +10,8 @@ def create_sharding(shard_type, train_state_shape=None):
     device_mesh = mesh_utils.create_device_mesh((jax.process_count(), jax.local_device_count()))
     mesh = Mesh(devices=device_mesh, axis_names=('fsdp', 'tp'))
     data_sharding_dp = NamedSharding(mesh, PartitionSpec(('fsdp', 'tp')))
-    data_sharding = NamedSharding(mesh, PartitionSpec('fsdp', 'tp'))
+    # data_sharding = NamedSharding(mesh, PartitionSpec('fsdp', 'tp'))
+    data_sharding = NamedSharding(mesh, PartitionSpec('fsdp'))
     no_shard = NamedSharding(mesh, PartitionSpec())
 
     if shard_type == 'dp':
@@ -72,7 +73,10 @@ def create_sharding(shard_type, train_state_shape=None):
             if jax.local_device_count() == jax.device_count():
                 return jax.device_put(x, data_sharding_dp)
             else:
-                return jax.make_array_from_process_local_data(sharding, x)
+                if sharding == data_sharding:
+                    return jax.device_put(x, sharding)
+                else:
+                    return jax.make_array_from_process_local_data(sharding, x)
         if len(args) == 1:
             return _shard_data(args[0])
         return jax.tree_util.tree_map(_shard_data, args)
