@@ -6,6 +6,9 @@ import json
 import glob
 from safetensors import safe_open
 import re
+from functools import partial
+from jax.experimental.pallas.ops.tpu.flash_attention import BlockSizes as TPUBlockSizes
+from jax.experimental.pallas.ops.tpu.flash_attention import	flash_attention as pallas_flash_attention_tpu
 
 import jax
 import jax.numpy as jnp
@@ -13,6 +16,81 @@ import flax
 
 import flax.linen as nn
 import jax.numpy as jnp
+import einops
+
+# # Change this if you are training on a gpu.
+# import lmpo.models.flash_attn as jfa
+# jfa_raw = jfa.FlashAttention(
+#     jfa.AttentionConfig(
+#         platform=jfa.Platform.PALLAS,  # Options: TRITON, PALLAS, JAX
+#         backend=jfa.Backend.TPU,       # Options: GPU, TPU, CPU
+#     )
+# )
+
+		# return partial(
+		# 	pallas_flash_attention_tpu,
+		# 	sm_scale=self.config.softmax_scale,
+		# 	block_sizes=block_sizes,
+		# 	causal=causal,
+		# )(
+		# 	query.transpose(0, 2, 1, 3),
+		# 	key.transpose(0, 2, 1, 3),
+		# 	value.transpose(0, 2, 1, 3),
+		# 	bias,
+		# ).transpose(0, 2, 1, 3)
+
+from jax.experimental import mesh_utils
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
+device_mesh = mesh_utils.create_device_mesh((jax.device_count(),))
+mesh = Mesh(devices=device_mesh, axis_names=('devices'))
+data_sharding = PartitionSpec('devices')
+
+def repeat_kv_heads(k, v, num_reps: int):
+    return (
+        einops.repeat(k, "b s h d -> b s (h r) d", r=num_reps),
+        einops.repeat(v, "b s h d -> b s (h r) d", r=num_reps),
+    )
+
+# q: (batch, sequence, q_heads, head_dim)
+@partial(jax.shard_map, 
+         mesh=mesh,
+         in_specs=(data_sharding, data_sharding, data_sharding, data_sharding),
+         out_specs=data_sharding,
+         check_vma=False)
+def flash_attention(q, k, v, attention_mask):
+    blocksize_q = 128
+    blocksize_k = 128
+    k, v = repeat_kv_heads(k, v, q.shape[2] // k.shape[2])
+    query_length = q.shape[1]
+    value_length = v.shape[1]
+    # TPU implementation
+    block_sizes = TPUBlockSizes(
+        block_q=min(blocksize_q, query_length),
+        block_k_major=min(blocksize_k, value_length),
+        block_k=min(blocksize_k, value_length),
+        block_b=1,
+        block_q_major_dkv=min(blocksize_q, query_length),
+        block_k_major_dkv=min(blocksize_k, value_length),
+        block_k_dkv=min(blocksize_k, value_length),
+        block_q_dkv=min(blocksize_q, query_length),
+        block_k_major_dq=min(blocksize_k, value_length),
+        block_k_dq=min(blocksize_k, value_length),
+        block_q_dq=min(blocksize_q, query_length),
+    )
+
+    attention_mask = attention_mask.transpose(0, 3, 1, 2)  # B 1 T T
+    attention_mask = einops.repeat(attention_mask, "b 1 t T -> b h t T", h=q.shape[2])  # B h T T
+    # ab = (1 - attention_mask).astype(jnp.float32) * (-0.7 * float(jnp.finfo(jnp.dtype("float32")).max))
+              
+    return pallas_flash_attention_tpu(
+        q.transpose(0, 2, 1, 3),
+        k.transpose(0, 2, 1, 3),
+        v.transpose(0, 2, 1, 3),
+        sm_scale=1.0 / q.shape[-1]**0.5,
+        block_sizes=block_sizes,
+        causal=True if k.shape[1] == q.shape[1] else False,
+        # ab=ab,
+    ).transpose(0, 2, 1, 3).astype(jnp.bfloat16)
 
 def rms_norm(x, gamma, eps):
     rms = jnp.sqrt(jnp.mean(jnp.astype(x, jnp.float32) ** 2, axis=-1, keepdims=True) + eps)
@@ -80,81 +158,83 @@ class Block(nn.Module):
     head_dim: int
     mlp_ffw_size: int
     eps: float = 1e-6
+    use_remat: bool = False
 
     @nn.compact
-    def __call__(self, x, sin, cos, token_mask, layer_id, cache=None):
+    def __call__(self, x_in, sin_in, cos_in, mask_in, token_mask_in, layer_id_in, cache_in=None):
 
-        # =========================
-        # === Self-Attention Block. 
-        # =========================
+        # We define the params out here in case we want to transform block_fwd with jax.remat.
 
         pre_gamma = self.param('pre_gamma', nn.initializers.constant(1.0), (self.hidden_size,))
-        x_norm = rms_norm(x, pre_gamma, self.eps)
-        
-        # Calculate Q,K,V.
-        q = nn.Dense(self.q_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(x_norm)
-        q = jnp.reshape(q, (q.shape[0], q.shape[1], self.q_heads, self.head_dim))
-        k = nn.Dense(self.kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(x_norm)
-        k = jnp.reshape(k, (k.shape[0], k.shape[1], self.kv_heads, self.head_dim))
-        v = nn.Dense(self.kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(x_norm)
-        v = jnp.reshape(v, (v.shape[0], v.shape[1], self.kv_heads, self.head_dim))
-
         q_gamma = self.param('q_gamma', nn.initializers.constant(1.0), (self.head_dim,))
-        q = rms_norm(q, q_gamma, self.eps)
-        q = apply_rotary_embedding(q, sin, cos)
         k_gamma = self.param('k_gamma', nn.initializers.constant(1.0), (self.head_dim,))
-        k = rms_norm(k, k_gamma, self.eps)
-        k = apply_rotary_embedding(k, sin, cos)
-
-        if cache is not None:
-            k = jax.lax.dynamic_update_slice_in_dim(cache.k[layer_id], k, cache.length, axis=1)
-            v = jax.lax.dynamic_update_slice_in_dim(cache.v[layer_id], v, cache.length, axis=1)
-            time_idx = jnp.arange(0, v.shape[1], dtype=jnp.int32)[None, :] # [1, seqlen]
-            q_idx = jnp.where(token_mask != 0, 1, 0) # [B, seqlen] where tokens exist.
-            incremental_pos = jnp.max(length_minus_padding(token_mask))
-            k_idx = (time_idx >= cache.starts[:, None]) & (time_idx < (cache.length + incremental_pos).astype(jnp.int32))
-            q_offset = cache.length
-        else:
-            q_idx, k_idx = token_mask, token_mask
-            q_offset = 0
-
-        # Causal Attention Mask.
-        b, t, qh, d = q.shape # qh = 16
-        _, T, kh, _ = k.shape # kh = 8
-        mask = q_idx[:, :, None] & k_idx[:, None, :]
-        mask = mask[:, None, :, :] # [B, 1, t, T]
-        qk_size = (1, 1, t, T)
-        q_iota = jax.lax.broadcasted_iota(jnp.int32, qk_size, 2)
-        k_iota = jax.lax.broadcasted_iota(jnp.int32, qk_size, 3)
-        q_positions = q_iota + q_offset
-        causal_mask = q_positions >= k_iota
-        mask = jnp.logical_and(mask, causal_mask)
-        mask = jnp.transpose(mask, (0, 2, 3, 1)) # [B, t, T, 1]
-
-        # Attention.
-        q = jnp.reshape(q, (b, t, kh, qh // kh, d))
-        qk = jnp.einsum("bthgd,bThd->btThg", q, k) * (d ** -0.5)
-        qk = jnp.reshape(qk, (b, t, T, qh)) 
-        qk = jnp.where(mask, qk, -1e30) # good
-        attn = jax.nn.softmax(qk.astype(jnp.float32), axis=2) # on T dimension.
-        attn = jnp.reshape(attn, (b, t, T, kh, qh // kh))
-        qkv = jnp.einsum("btThg,bThd->bthgd", attn, v).astype(x.dtype)
-        qkv = jnp.reshape(qkv, (b, t, qh*d))
-        attn_x = nn.Dense(self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(qkv)
-        x = x + attn_x
-        
-        # =========================
-        # === MLP Block. 
-        # =========================
         post_gamma = self.param('post_gamma', nn.initializers.constant(1.0), (self.hidden_size,))
-        x_norm = rms_norm(x, post_gamma, self.eps)
-        g = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(x_norm)
-        g = nn.silu(g)
-        y = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(x_norm)
-        y = g * y
-        mlp_x = nn.Dense(features=self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(y)
-        x = x + mlp_x
-        return x, k, v
+
+        def block_fwd(x, sin, cos, mask, token_mask, layer_id, cache):
+            # =========================
+            # === Self-Attention Block. 
+            # =========================
+
+            x_norm = rms_norm(x, pre_gamma, self.eps)
+            
+            # Calculate Q,K,V.
+            q = nn.Dense(self.q_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(x_norm)
+            q = jnp.reshape(q, (q.shape[0], q.shape[1], self.q_heads, self.head_dim)) # (batch, seq_len, q_heads, head_dim)
+            k = nn.Dense(self.kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(x_norm)
+            k = jnp.reshape(k, (k.shape[0], k.shape[1], self.kv_heads, self.head_dim))
+            v = nn.Dense(self.kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(x_norm)
+            v = jnp.reshape(v, (v.shape[0], v.shape[1], self.kv_heads, self.head_dim))
+
+            q = rms_norm(q, q_gamma, self.eps)
+            q = apply_rotary_embedding(q, sin, cos)
+            k = rms_norm(k, k_gamma, self.eps)
+            k = apply_rotary_embedding(k, sin, cos)
+
+            if cache is not None:
+                k = jax.lax.dynamic_update_slice_in_dim(cache.k[layer_id], k, cache.length, axis=1)
+                v = jax.lax.dynamic_update_slice_in_dim(cache.v[layer_id], v, cache.length, axis=1)
+
+            if cache is None:
+                # Flash attention for training.
+                qkv = flash_attention(q,k,v,token_mask)
+                qkv = jnp.reshape(qkv, (qkv.shape[0], qkv.shape[1], self.q_heads * self.head_dim))
+            else:
+                # Naive attention for inference.
+                b, t, qh, d = q.shape # qh = 16
+                _, T, kh, _ = k.shape # kh = 8
+                q = jnp.reshape(q, (b, t, kh, qh // kh, d))
+                qk = jnp.einsum("bthgd,bThd->btThg", q, k) * (d ** -0.5)
+                qk = jnp.reshape(qk, (b, t, T, qh)) 
+                qk = jnp.where(mask, qk, -1e30) # good
+                attn = jax.nn.softmax(qk.astype(jnp.float32), axis=2) # on T dimension.
+                attn = jnp.reshape(attn, (b, t, T, kh, qh // kh))
+                qkv = jnp.einsum("btThg,bThd->bthgd", attn, v).astype(x.dtype)
+                qkv = jnp.reshape(qkv, (b, t, qh*d))
+
+            attn_x = nn.Dense(self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(qkv)
+            x = x + attn_x
+            
+            # =========================
+            # === MLP Block. 
+            # =========================
+            x_norm = rms_norm(x, post_gamma, self.eps)
+
+            @jax.remat
+            def mlp_block(xi):
+                g = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(xi)
+                g = nn.silu(g)
+                y = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(xi)
+                y = g * y
+                mlp_x = nn.Dense(features=self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(y)
+                return mlp_x
+            mlp_x = mlp_block(x_norm)
+
+            x = x + mlp_x
+            return x, k, v
+        if self.use_remat:
+            return jax.remat(block_fwd, static_argnums=4)(x_in, sin_in, cos_in, mask_in, token_mask_in, layer_id_in, cache_in)
+        else:
+            return block_fwd(x_in, sin_in, cos_in, mask_in, token_mask_in, layer_id_in, cache_in)
 
 class Qwen3Model(nn.Module):
     hidden_size: int
@@ -167,6 +247,7 @@ class Qwen3Model(nn.Module):
     rope_theta: int
     eps: float = 1e-6
     use_v_head: bool = False
+    use_remat: bool = False
 
     @nn.compact
     def __call__(self, x, token_mask, cache = None, get_logits=True):
@@ -180,8 +261,33 @@ class Qwen3Model(nn.Module):
         positions = start_indices[:, None] + positions
         sin, cos = generate_pos_embeddings(positions, self.head_dim, self.rope_theta)
         sin, cos = sin.astype(jnp.bfloat16), cos.astype(jnp.bfloat16)
+
+        # Attention Mask calculation: Do this once and resuse it.
+        if cache is not None:
+            T = cache.k[0].shape[1]
+            time_idx = jnp.arange(0, T, dtype=jnp.int32)[None, :] # [1, seqlen]
+            q_idx = jnp.where(token_mask != 0, 1, 0) # [B, seqlen] where tokens exist.
+            incremental_pos = jnp.max(length_minus_padding(token_mask))
+            k_idx = (time_idx >= cache.starts[:, None]) & (time_idx < (cache.length + incremental_pos).astype(jnp.int32))
+            q_offset = cache.length
+        else:
+            T = x.shape[1]
+            q_idx, k_idx = token_mask, token_mask
+            q_offset = 0
+
+        # Causal Attention Mask.
+        mask = q_idx[:, :, None] & k_idx[:, None, :]
+        mask = mask[:, None, :, :] # [B, 1, t, T]
+        qk_size = (1, 1, x.shape[1], T)
+        q_iota = jax.lax.broadcasted_iota(jnp.int32, qk_size, 2)
+        k_iota = jax.lax.broadcasted_iota(jnp.int32, qk_size, 3)
+        q_positions = q_iota + q_offset
+        causal_mask = q_positions >= k_iota
+        mask = jnp.logical_and(mask, causal_mask)
+        mask = jnp.transpose(mask, (0, 2, 3, 1)) # [B, t, T, 1]
+
         for layer_id in range(self.num_layers):
-            x, k, v = Block(hidden_size=self.hidden_size, q_heads=self.q_heads, kv_heads=self.kv_heads, head_dim=self.head_dim, mlp_ffw_size=self.mlp_ffw_size, eps=self.eps)(x, sin, cos, token_mask, layer_id, cache)
+            x, k, v = Block(hidden_size=self.hidden_size, q_heads=self.q_heads, kv_heads=self.kv_heads, head_dim=self.head_dim, mlp_ffw_size=self.mlp_ffw_size, eps=self.eps, use_remat=self.use_remat)(x, sin, cos, mask, token_mask, layer_id, cache)
             if cache is not None:
                 cache.k[layer_id] = k
                 cache.v[layer_id] = v
@@ -279,7 +385,7 @@ def create_model_from_hf(hf_dir: str):
     
     return model, params
 
-def create_model_from_ckpt(ckpt_dir: str, use_v_head: bool = False):
+def create_model_from_ckpt(ckpt_dir: str, use_v_head: bool = False, use_remat: bool = False):
     from lmpo.utils.checkpoint import Checkpoint
     with open(ckpt_dir + "config.json") as f:
         cfg = json.load(f)
@@ -294,6 +400,7 @@ def create_model_from_ckpt(ckpt_dir: str, use_v_head: bool = False):
         eps=cfg['rms_norm_eps'],
         rope_theta=cfg['rope_theta'],
         use_v_head=use_v_head,
+        use_remat=use_remat,
     )
     ckpt = Checkpoint(ckpt_dir + "params.pkl", parallel=False)
     params = ckpt.load_as_dict()['params']

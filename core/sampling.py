@@ -19,8 +19,9 @@ def pad_and_collate(token_batch: list, pad_id: int = 0, force_length: int = None
         max_len = force_length
     return np.array([(max_len - len(x)) * [pad_id] + x for x in token_batch])
 
-model_apply_prefill = None # Global variable to cache the JIT-compiled model application function.
-model_apply_generate = None
+# model_apply_prefill = None # Global variable to cache the JIT-compiled model application function.
+# model_apply_generate = None
+model_apply = None
 def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generation_tokens, rng, temp=1, pad_id=0, data_shard=None, no_shard=None, params_shard=None, prefill_batch_split=4, force_answer_at=-1, return_logprobs=False):
     """
     Samples tokens autoregressively, and can batch for performance.
@@ -28,64 +29,39 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
         prompt_tokens: An array of tokens, padded by `pad_id` on the LEFT. [batch, time].
         force_answer_at: If > 0, forces the insertion of an <answer> tag at (force_answer_at) tokens before the end of the generation.
     """
-    global model_apply_prefill, model_apply_generate
+    global model_apply
     batch_size = prompt_tokens.shape[0]
     token_mask = jnp.where(prompt_tokens != pad_id, 1, 0).astype(jnp.int32)
     max_seq_len = prompt_tokens.shape[1] + num_generation_tokens
 
-    cache_sharding = KVCache.get_sharding(data_shard, no_shard)
     if params_shard is not None:
         params = jax.device_put(params, params_shard)
 
-    if model_apply_prefill is None:
-        @partial(jax.jit, out_shardings=cache_sharding)
-        def model_apply_prefill(params, tokens, token_mask):
-            cache = KVCache.create(model.num_layers, tokens.shape[0], prompt_tokens.shape[1], model.head_dim, model.kv_heads)
-            cache = cache.replace(starts=count_left_padding(tokens, pad_id=pad_id))
-            _, cache = model.apply({'params': params}, tokens, token_mask, cache=cache, get_logits=False)
-            return cache
-        
-    caches = []
-    for i in range(prefill_batch_split):
-        start_idx = (batch_size // prefill_batch_split) * i
-        end_idx = (batch_size // prefill_batch_split) * (i + 1) if i < prefill_batch_split - 1 else batch_size
-        cache = model_apply_prefill(params, prompt_tokens[start_idx:end_idx], token_mask[start_idx:end_idx])
-        caches.append(cache)
-            
-    starts = jnp.concatenate([c.starts for c in caches], axis=0)
-    cache = KVCache(k=[], v=[], length=caches[0].length, starts=starts)
+    cache_sharding = KVCache.get_sharding(data_shard, no_shard)
+    @partial(jax.jit, out_shardings=cache_sharding)
+    def get_cache():
+        return KVCache.create(model.num_layers, batch_size, max_seq_len, model.head_dim, model.kv_heads)
+    cache = get_cache()  # [batch, num_layers, max_seq_len, head_dim]
+    cache = cache.replace(starts=count_left_padding(prompt_tokens, pad_id=pad_id))
 
-    @partial(jax.jit, out_shardings=data_shard)
-    def concat_kv(k, v):
-        k = jnp.concatenate(k, axis=0)
-        v = jnp.concatenate(v, axis=0)
-        k = jnp.pad(k, ((0,0),(0,max_seq_len - k.shape[1]),(0,0),(0,0)), constant_values=0)
-        v = jnp.pad(v, ((0,0),(0,max_seq_len - v.shape[1]),(0,0),(0,0)), constant_values=0)
-        return k, v
-    for i in range(len(caches[0].k)-1, -1, -1):
-        k, v = concat_kv([c.k[i] for c in caches], [c.v[i] for c in caches])
-        cache.k.append(k)
-        cache.v.append(v)
-        for c in caches:
-            del c.k[i]
-            del c.v[i]
-        # print("Memory usage after concat cache:", get_memory_usage(), "GB")
-    del caches
-    cache = cache.replace(k=cache.k[::-1], v=cache.v[::-1]) # Reverse the list.
-    reshape_fn = jax.jit(lambda x: x, out_shardings=cache_sharding, donate_argnums=0)
-    cache = reshape_fn(cache) # Reshard the cache.
-    print("Memory usage after reshard cache:", get_memory_usage(), "GB")
-
-    if model_apply_generate is None:
-        @partial(jax.jit, out_shardings=(no_shard, no_shard, cache_sharding), donate_argnums=3)
-        def model_apply_generate(params, tokens, token_mask, cache, key):
-            logits, cache = model.apply({'params': params}, tokens, token_mask, cache=cache, get_logits=True)
-            logits = logits[:, 0, :]
-            logprobs = jax.nn.log_softmax(logits / temp, axis=-1)
-            sampled_token = jax.random.categorical(key, logits/temp, axis=-1)
-            sampled_logprobs = jnp.sum(logprobs * jax.nn.one_hot(sampled_token, logits.shape[-1]), axis=-1)
+    if model_apply is None:
+        @partial(jax.jit, out_shardings=(no_shard, no_shard, cache_sharding), donate_argnums=3, static_argnames=['sample_token'])
+        def model_apply(params, tokens, token_mask, cache, key=None, sample_token=False):
+            params = jax.tree.map(lambda p: p.astype(jnp.bfloat16), params)
+            print("JIT compiling sampling for tokens of shape", tokens.shape, "max_seq_len", max_seq_len)
+            logits, cache = model.apply({'params': params}, tokens, token_mask, cache=cache, get_logits=sample_token)
+            if sample_token:
+                logits = logits[:, 0, :]
+                sampled_token = jax.random.categorical(key, logits/temp, axis=-1)
+                logprobs = jax.nn.log_softmax(logits / temp, axis=-1)
+                sampled_logprobs = jnp.sum(logprobs * jax.nn.one_hot(sampled_token, logits.shape[-1]), axis=-1)
+            else:
+                sampled_token = None
+                sampled_logprobs = None
             return sampled_token, sampled_logprobs, cache
 
+    # Fill cache with the prompt tokens.
+    _, _, cache = model_apply(params, prompt_tokens[:, :-1], token_mask[:, :-1], cache=cache, sample_token=False)
     sampled_token = prompt_tokens[:, -1]  # Start with the last token of the prompt.
     tokens_list = []
     logprobs_list = []
@@ -94,8 +70,7 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
     for i in tqdm.tqdm(range(max_samples)):
         next_token_mask = jnp.ones(sampled_token.shape, dtype=jnp.int32)
         key, rng = jax.random.split(rng)
-
-        sampled_token, sampled_logprobs, cache = model_apply_generate(params, sampled_token[:, None], next_token_mask[:, None], cache=cache, key=key)
+        sampled_token, sampled_logprobs, cache = model_apply(params, sampled_token[:, None], next_token_mask[:, None], cache=cache, key=key, sample_token=True)
 
         # Yes, this is very ugly, even a sin. 
         # It's a helper flag to force insertion of an <answer> tag (force_answer_at) tokens before the end.
