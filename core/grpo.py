@@ -1,36 +1,7 @@
-import jax.numpy as jnp
-import jax
-import numpy as np
-import tqdm
-import optax
-from functools import partial
-import wandb
 import ml_collections
+from absl import app, flags;
 import sys
-import time
-import shutil
-from absl import app, flags
-import contextlib
-from jax.ad_checkpoint import print_saved_residuals
-
-try: # If you like to use these helpers, you can.
-    from jax.experimental.compilation_cache import compilation_cache as cc
-    cc.set_cache_dir('/home/kvfrans/jax-cache')
-    from localutils.debugger import enable_debug
-    enable_debug()
-except:
-    pass
-
-from lmpo.models.qwen3 import create_model_from_ckpt
 from lmpo.utils.configs import define_flag_dict
-from lmpo.utils.wandb import setup_wandb
-from lmpo.envs.env_creator import create_env
-from lmpo.utils.sharding import create_sharding, host_gather, get_memory_usage, get_local_slice
-from lmpo.utils.train_state import TrainState
-from lmpo.models.tokenizer import create_tokenizer
-from lmpo.utils.checkpoint import Checkpoint
-from lmpo.core.sampling import pad_and_collate, autoregressive_sample
-from lmpo.core.eval import eval_model
 
 config = ml_collections.ConfigDict({
     'wandb_project': "lmpo",
@@ -69,16 +40,57 @@ config = ml_collections.ConfigDict({
     'kl_coef': 0.001,
     'weight_decay': 1e-2,
     'use_remat': 0,
+    'train_vocab': 1,
     # Non-training settings.
-    'sharding': 'tfsdp',
+    'sharding': 'fsdp',
+    'use_xla_flags': 1,
     # For offline data collection.
     'do_save_rollouts': 0,
     'save_rollouts_dir': 'rollouts/',
     'profile': 0, 
 })
+
 define_flag_dict(config)
 FLAGS = flags.FLAGS
 FLAGS(sys.argv)
+
+if FLAGS.use_xla_flags:
+    import os
+    # This flag is important when using FSDP to prevent excessive communication buffers.
+    # Must be set before jax is imported.
+    os.environ['LIBTPU_INIT_ARGS'] = '--xla_tpu_enable_latency_hiding_scheduler=false --xla_should_allow_loop_variant_parameter_in_chain=enabled --xla_should_add_loop_invariant_op_in_chain=enabled --xla_tpu_enable_ici_ag_pipelining=true'
+
+import jax.numpy as jnp
+import jax
+import numpy as np
+import tqdm
+import optax
+from functools import partial
+import wandb
+import time
+import shutil
+
+import contextlib
+from jax.ad_checkpoint import print_saved_residuals
+
+try: # If you like to use these helpers, you can.
+    from jax.experimental.compilation_cache import compilation_cache as cc
+    cc.set_cache_dir('/home/kvfrans/jax-cache')
+    from localutils.debugger import enable_debug
+    enable_debug()
+except:
+    pass
+
+from lmpo.models.qwen3 import create_model_from_ckpt
+from lmpo.utils.wandb import setup_wandb
+from lmpo.envs.env_creator import create_env
+from lmpo.utils.sharding import create_sharding, host_gather, get_memory_usage, get_local_slice
+from lmpo.utils.train_state import TrainState
+from lmpo.models.tokenizer import create_tokenizer
+from lmpo.utils.checkpoint import Checkpoint
+from lmpo.core.sampling import pad_and_collate, autoregressive_sample
+from lmpo.core.eval import eval_model
+
 if jax.process_index() == 0:
     setup_wandb(FLAGS.flag_values_dict(), project=FLAGS.wandb_project, name=FLAGS.env_name+'-'+FLAGS.wandb_name, group=FLAGS.wandb_group)
     rollouts_list = []
@@ -100,7 +112,7 @@ train_state = jax.jit(lambda r, p: init_fn(rng=r, params=p), out_shardings=train
 del params
 print("Memory usage train_state:", get_memory_usage(), "GB")
 
-jax.debug.visualize_array_sharding(train_state.params['Block_0']['Dense_0']['kernel'])
+# jax.debug.visualize_array_sharding(train_state.params['Block_0']['Dense_0']['kernel'])
 tokenizer = create_tokenizer(ckpt_dir)
 pad_id = tokenizer.get_pad_token_id()
 
@@ -136,19 +148,22 @@ def get_logprobs(train_state: TrainState, token_batch, mask):
     logprobs = jnp.sum(logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
     return logprobs
 
-@partial(jax.jit, out_shardings=(train_state_shard, None))
+@partial(jax.jit, out_shardings=(train_state_shard, None), donate_argnums=(0,))
 def update(train_state: TrainState, token_batch, mask_origin, advantages_in, recalc_logprobs, inference_logprobs):
     print("JIT compiling update function for token_batch of shape", token_batch.shape)
-    # text_target = token_batch[:, 1:] # (batch, seq)
     text_target = jnp.concat([token_batch[:, 1:], jnp.zeros((token_batch.shape[0], 1), dtype=token_batch.dtype)], axis=-1)
     inference_logprobs = inference_logprobs[:, 1:]
     mask_origin = mask_origin[:, 1:]
     is_max_tokens = (mask_origin[:, -1] == True)
     token_mask = jnp.where(token_batch != pad_id, 1, 0).astype(jnp.int32)
     def loss_fn(grad_params):
+        if not FLAGS.train_vocab:
+            grad_params['Dense_0']['kernel'] = jax.lax.stop_gradient(grad_params['Dense_0']['kernel'])
+            grad_params['Embed_0']['embedding'] = jax.lax.stop_gradient(grad_params['Embed_0']['embedding'])
         logits, _ = train_state.call_model(token_batch, token_mask, cache=None, params=grad_params)
         all_logprobs = jax.nn.log_softmax(logits) # [batch, time, vocab_size]
         token_logprobs = jnp.sum(all_logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
+
         token_logprobs = token_logprobs[:, :-1]  # [batch, time-1]
         entropy = -jnp.sum(jax.nn.softmax(logits) * all_logprobs, axis=-1)
         entropy = entropy[:, :-1]  # [batch, time-1]
@@ -374,23 +389,21 @@ with contextlib.nullcontext():
         # Then, the training loop.
         update_time_start = time.time()
         with jax.profiler.trace('/mount/code/dqlm/lmpo/tensorboard') if jax.process_index() == 0 and FLAGS.profile else contextlib.nullcontext():
-            # for j in range(global_batch_size // FLAGS.ppo_minibatch):
-            for _ in range(2):
-                j = 0
+            for j in range(global_batch_size // FLAGS.ppo_minibatch):
                 print("Memory usage before update:", get_memory_usage(), "GB")
                 train_state, info = update(train_state, tokens_all_minibatch[:, j], mask_minibatch[:, j], advantages_minibatch[:, j], 
                                         logprobs_all_minibatch[:, j], inference_logprobs_all_minibatch[:, j])
                 
-                compiled_step = update.lower(train_state, tokens_all_minibatch[:, j], mask_minibatch[:, j], advantages_minibatch[:, j], 
-                                        logprobs_all_minibatch[:, j], inference_logprobs_all_minibatch[:, j]).compile()
-                compiled_stats = compiled_step.memory_analysis()
-                if compiled_stats is not None:
-                    total = compiled_stats.temp_size_in_bytes + compiled_stats.argument_size_in_bytes \
-                        + compiled_stats.output_size_in_bytes - compiled_stats.alias_size_in_bytes
-                    print(f"Temp size: {compiled_stats.temp_size_in_bytes / (1024**3):.2f} GB")
-                    print(f"Argument size: {compiled_stats.argument_size_in_bytes / (1024**3):.2f} GB")
-                    print(f"Output size: {compiled_stats.output_size_in_bytes / (1024**3):.2f} GB")
-                    print(f"Total size: {total / (1024**3):.2f} GB")
+                # compiled_step = update.lower(train_state, tokens_all_minibatch[:, j], mask_minibatch[:, j], advantages_minibatch[:, j], 
+                #                         logprobs_all_minibatch[:, j], inference_logprobs_all_minibatch[:, j]).compile()
+                # compiled_stats = compiled_step.memory_analysis()
+                # if compiled_stats is not None:
+                #     total = compiled_stats.temp_size_in_bytes + compiled_stats.argument_size_in_bytes \
+                #         + compiled_stats.output_size_in_bytes - compiled_stats.alias_size_in_bytes
+                #     print(f"Temp size: {compiled_stats.temp_size_in_bytes / (1024**3):.2f} GB")
+                #     print(f"Argument size: {compiled_stats.argument_size_in_bytes / (1024**3):.2f} GB")
+                #     print(f"Output size: {compiled_stats.output_size_in_bytes / (1024**3):.2f} GB")
+                #     print(f"Total size: {total / (1024**3):.2f} GB")
 
                 info = jax.device_get(info)
                 info['output_tokens'] = eos_idx

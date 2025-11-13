@@ -7,7 +7,7 @@ import glob
 from safetensors import safe_open
 import re
 from functools import partial
-from jax.experimental.pallas.ops.tpu.flash_attention import BlockSizes as TPUBlockSizes
+from jax.experimental.pallas.ops.tpu.flash_attention import BlockSizes, SegmentIds
 from jax.experimental.pallas.ops.tpu.flash_attention import	flash_attention as pallas_flash_attention_tpu
 
 import jax
@@ -17,27 +17,6 @@ import flax
 import flax.linen as nn
 import jax.numpy as jnp
 import einops
-
-# # Change this if you are training on a gpu.
-# import lmpo.models.flash_attn as jfa
-# jfa_raw = jfa.FlashAttention(
-#     jfa.AttentionConfig(
-#         platform=jfa.Platform.PALLAS,  # Options: TRITON, PALLAS, JAX
-#         backend=jfa.Backend.TPU,       # Options: GPU, TPU, CPU
-#     )
-# )
-
-		# return partial(
-		# 	pallas_flash_attention_tpu,
-		# 	sm_scale=self.config.softmax_scale,
-		# 	block_sizes=block_sizes,
-		# 	causal=causal,
-		# )(
-		# 	query.transpose(0, 2, 1, 3),
-		# 	key.transpose(0, 2, 1, 3),
-		# 	value.transpose(0, 2, 1, 3),
-		# 	bias,
-		# ).transpose(0, 2, 1, 3)
 
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
@@ -51,20 +30,20 @@ def repeat_kv_heads(k, v, num_reps: int):
         einops.repeat(v, "b s h d -> b s (h r) d", r=num_reps),
     )
 
-# q: (batch, sequence, q_heads, head_dim)
+@jax.remat
 @partial(jax.shard_map, 
          mesh=mesh,
          in_specs=(data_sharding, data_sharding, data_sharding, data_sharding),
          out_specs=data_sharding,
          check_vma=False)
-def flash_attention(q, k, v, attention_mask):
+def flash_attention(q, k, v, token_mask):
     blocksize_q = 128
     blocksize_k = 128
     k, v = repeat_kv_heads(k, v, q.shape[2] // k.shape[2])
     query_length = q.shape[1]
     value_length = v.shape[1]
     # TPU implementation
-    block_sizes = TPUBlockSizes(
+    block_sizes = BlockSizes(
         block_q=min(blocksize_q, query_length),
         block_k_major=min(blocksize_k, value_length),
         block_k=min(blocksize_k, value_length),
@@ -78,9 +57,21 @@ def flash_attention(q, k, v, attention_mask):
         block_q_dq=min(blocksize_q, query_length),
     )
 
-    attention_mask = attention_mask.transpose(0, 3, 1, 2)  # B 1 T T
-    attention_mask = einops.repeat(attention_mask, "b 1 t T -> b h t T", h=q.shape[2])  # B h T T
-    # ab = (1 - attention_mask).astype(jnp.float32) * (-0.7 * float(jnp.finfo(jnp.dtype("float32")).max))
+    segment_ids = SegmentIds(token_mask, token_mask)
+
+    # NOTE: If running on GPU, try using the triton flash attention implementation:
+    # from .flash_attention_triton import triton_flash_attention
+    # attn = triton_flash_attention(
+    #     q=q,
+    #     k=k,
+    #     v=v,
+    #     bias=None,
+    #     attention_mask=None,
+    #     dropout_prob=0,
+    #     causal=True if k.shape[1] == q.shape[1] else False,,
+    #     dropout_seed=None,
+    #     softmax_scale=1.0 / q.shape[-1]**0.5,
+    # )
               
     return pallas_flash_attention_tpu(
         q.transpose(0, 2, 1, 3),
@@ -89,7 +80,7 @@ def flash_attention(q, k, v, attention_mask):
         sm_scale=1.0 / q.shape[-1]**0.5,
         block_sizes=block_sizes,
         causal=True if k.shape[1] == q.shape[1] else False,
-        # ab=ab,
+        segment_ids=segment_ids,
     ).transpose(0, 2, 1, 3).astype(jnp.bfloat16)
 
 def rms_norm(x, gamma, eps):
@@ -150,6 +141,21 @@ class KVCache(flax.struct.PyTreeNode):
         # Yes, the type annotations are wrong, but this works nicely for jax sharding...
         return KVCache(k=cache_shard, v=cache_shard, length=none_shard, starts=cache_shard)
 
+
+# class MLPBlock(nn.Module):
+#     hidden_size: int
+#     mlp_ffw_size: int
+    
+#     @nn.checkpoint
+#     @nn.compact
+#     def __call__(self, x):
+#         g = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(x)
+#         g = nn.silu(g)
+#         y = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(x)
+#         y = g * y
+#         mlp_x = nn.Dense(features=self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(y)
+#         return mlp_x
+
 class Block(nn.Module):
     """ A standard transformer block. Has residual connection, self-attention, and a two-layer MLP. """
     hidden_size: int
@@ -158,11 +164,9 @@ class Block(nn.Module):
     head_dim: int
     mlp_ffw_size: int
     eps: float = 1e-6
-    use_remat: bool = False
 
     @nn.compact
     def __call__(self, x_in, sin_in, cos_in, mask_in, token_mask_in, layer_id_in, cache_in=None):
-
         # We define the params out here in case we want to transform block_fwd with jax.remat.
 
         pre_gamma = self.param('pre_gamma', nn.initializers.constant(1.0), (self.hidden_size,))
@@ -218,23 +222,24 @@ class Block(nn.Module):
             # === MLP Block. 
             # =========================
             x_norm = rms_norm(x, post_gamma, self.eps)
+            # mlp_x = MLPBlock(hidden_size=self.hidden_size, mlp_ffw_size=self.mlp_ffw_size)(x_norm)
 
-            @jax.remat
-            def mlp_block(xi):
-                g = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(xi)
-                g = nn.silu(g)
-                y = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(xi)
-                y = g * y
-                mlp_x = nn.Dense(features=self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(y)
-                return mlp_x
-            mlp_x = mlp_block(x_norm)
+            # @jax.remat
+            # def mlp_block(xi):
+            g = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(x_norm)
+            g = nn.silu(g)
+            y = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(x_norm)
+            y = g * y
+            mlp_x = nn.Dense(features=self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(y)
+            #     return mlp_x
+            # mlp_x = mlp_block(x_norm)
 
             x = x + mlp_x
             return x, k, v
-        if self.use_remat:
-            return jax.remat(block_fwd, static_argnums=4)(x_in, sin_in, cos_in, mask_in, token_mask_in, layer_id_in, cache_in)
-        else:
-            return block_fwd(x_in, sin_in, cos_in, mask_in, token_mask_in, layer_id_in, cache_in)
+        # if self.use_remat:
+        #     return jax.remat(block_fwd, static_argnums=5)(x_in, sin_in, cos_in, mask_in, token_mask_in, layer_id_in, cache_in)
+        # else:
+        return block_fwd(x_in, sin_in, cos_in, mask_in, token_mask_in, layer_id_in, cache_in)
 
 class Qwen3Model(nn.Module):
     hidden_size: int
@@ -286,8 +291,9 @@ class Qwen3Model(nn.Module):
         mask = jnp.logical_and(mask, causal_mask)
         mask = jnp.transpose(mask, (0, 2, 3, 1)) # [B, t, T, 1]
 
+        BlockFn = Block if not self.use_remat else nn.remat(Block, static_argnums=6)
         for layer_id in range(self.num_layers):
-            x, k, v = Block(hidden_size=self.hidden_size, q_heads=self.q_heads, kv_heads=self.kv_heads, head_dim=self.head_dim, mlp_ffw_size=self.mlp_ffw_size, eps=self.eps, use_remat=self.use_remat)(x, sin, cos, mask, token_mask, layer_id, cache)
+            x, k, v = BlockFn(hidden_size=self.hidden_size, q_heads=self.q_heads, kv_heads=self.kv_heads, head_dim=self.head_dim, mlp_ffw_size=self.mlp_ffw_size, eps=self.eps)(x, sin, cos, mask, token_mask, layer_id, cache)
             if cache is not None:
                 cache.k[layer_id] = k
                 cache.v[layer_id] = v
@@ -296,11 +302,11 @@ class Qwen3Model(nn.Module):
         x = rms_norm(x, gamma_final, self.eps)
         if not self.use_v_head:
             if get_logits:
-                logits = nn.Dense(self.vocab_size, use_bias=False)(x)
+                logits = nn.Dense(self.vocab_size, use_bias=False, dtype=jnp.bfloat16)(x)
             else:
                 logits = None
         else:
-            logits = nn.Dense(1, use_bias=False)(x) # V-prediction head.
+            logits = nn.Dense(1, use_bias=False, dtype=jnp.bfloat16)(x) # V-prediction head.
 
         if cache is not None:
             cache = cache.replace(length=cache.length + jnp.max(length_minus_padding(token_mask)))
@@ -373,12 +379,8 @@ def create_model_from_hf(hf_dir: str):
                     if len(jax_key_list) == 0:
                         if 'kernel' in jax_key:
                             new_param = torch_params[key].float().T.numpy()
-                            # new_param = jnp.array(torch_params[key].float()).T
-                            # new_param = jax.device_put(torch_params[key].float(), device=jax.devices("cpu")[0]).T
                         else:
                             new_param = torch_params[key].float().numpy()
-                            # new_param = jnp.array(torch_params[key].float())
-                            # new_param = jax.device_put(torch_params[key].float(), device=jax.devices("cpu")[0]).T
                         assert new_param.shape == jax_param[jax_key].shape
                         jax_param[jax_key] = new_param
                     jax_param = jax_param[jax_key]
@@ -404,5 +406,10 @@ def create_model_from_ckpt(ckpt_dir: str, use_v_head: bool = False, use_remat: b
     )
     ckpt = Checkpoint(ckpt_dir + "params.pkl", parallel=False)
     params = ckpt.load_as_dict()['params']
-        
+
+    if use_remat:
+        for key in list(params.keys()):
+            if 'Block' in key:
+                params['Checkpoint'+key] = params.pop(key)
+
     return model, params

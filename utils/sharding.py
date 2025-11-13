@@ -1,4 +1,5 @@
 from jax.experimental import mesh_utils
+from jax.experimental.multihost_utils import process_allgather
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 import jax
 import jax.numpy as jnp
@@ -107,7 +108,7 @@ def create_sharding(shard_type, train_state_shape=None):
 
 def host_gather(x):
     is_multi_host = len(jax.local_devices()) != len(jax.devices())
-    return jax.experimental.multihost_utils.process_allgather(x) if is_multi_host else x
+    return process_allgather(x) if is_multi_host else x
 
 def get_local_slice(x, mesh):
     local_devices = [d.id for d in mesh.local_devices]
