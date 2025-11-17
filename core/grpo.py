@@ -1,7 +1,42 @@
+import os
+# This flag is important when using FSDP to prevent excessive communication buffers.
+# Must be set before jax is imported.
+os.environ['LIBTPU_INIT_ARGS'] = '--xla_tpu_enable_latency_hiding_scheduler=false --xla_should_allow_loop_variant_parameter_in_chain=enabled --xla_should_add_loop_invariant_op_in_chain=enabled --xla_tpu_enable_ici_ag_pipelining=true'
+
 import ml_collections
 from absl import app, flags;
 import sys
 from lmpo.utils.configs import define_flag_dict
+import jax.numpy as jnp
+import jax
+import numpy as np
+import tqdm
+import optax
+from functools import partial
+import wandb
+import time
+import shutil
+
+import contextlib
+from jax.ad_checkpoint import print_saved_residuals
+
+try: # If you like to use these helpers, you can.
+    from jax.experimental.compilation_cache import compilation_cache as cc
+    cc.set_cache_dir('/home/kvfrans/jax-cache')
+    from localutils.debugger import enable_debug
+    enable_debug()
+except:
+    pass
+
+from lmpo.models.qwen3 import create_model_from_ckpt
+from lmpo.utils.wandb import setup_wandb
+from lmpo.envs.env_creator import create_env
+from lmpo.utils.sharding import create_sharding, host_gather, get_memory_usage, get_local_slice
+from lmpo.utils.train_state import TrainState
+from lmpo.models.tokenizer import create_tokenizer
+from lmpo.utils.checkpoint import Checkpoint
+from lmpo.core.sampling import pad_and_collate, autoregressive_sample
+from lmpo.core.eval import eval_model
 
 config = ml_collections.ConfigDict({
     'wandb_project': "lmpo",
@@ -55,42 +90,8 @@ define_flag_dict(config)
 FLAGS = flags.FLAGS
 FLAGS(sys.argv)
 
-if FLAGS.use_xla_flags:
-    import os
-    # This flag is important when using FSDP to prevent excessive communication buffers.
-    # Must be set before jax is imported.
-    os.environ['LIBTPU_INIT_ARGS'] = '--xla_tpu_enable_latency_hiding_scheduler=false --xla_should_allow_loop_variant_parameter_in_chain=enabled --xla_should_add_loop_invariant_op_in_chain=enabled --xla_tpu_enable_ici_ag_pipelining=true'
-
-import jax.numpy as jnp
-import jax
-import numpy as np
-import tqdm
-import optax
-from functools import partial
-import wandb
-import time
-import shutil
-
-import contextlib
-from jax.ad_checkpoint import print_saved_residuals
-
-try: # If you like to use these helpers, you can.
-    from jax.experimental.compilation_cache import compilation_cache as cc
-    cc.set_cache_dir('/home/kvfrans/jax-cache')
-    from localutils.debugger import enable_debug
-    enable_debug()
-except:
-    pass
-
-from lmpo.models.qwen3 import create_model_from_ckpt
-from lmpo.utils.wandb import setup_wandb
-from lmpo.envs.env_creator import create_env
-from lmpo.utils.sharding import create_sharding, host_gather, get_memory_usage, get_local_slice
-from lmpo.utils.train_state import TrainState
-from lmpo.models.tokenizer import create_tokenizer
-from lmpo.utils.checkpoint import Checkpoint
-from lmpo.core.sampling import pad_and_collate, autoregressive_sample
-from lmpo.core.eval import eval_model
+if not FLAGS.use_xla_flags:
+    assert "Disable the XLS flags manually if you want to set use_xla_flags to False."
 
 if jax.process_index() == 0:
     setup_wandb(FLAGS.flag_values_dict(), project=FLAGS.wandb_project, name=FLAGS.env_name+'-'+FLAGS.wandb_name, group=FLAGS.wandb_group)
@@ -113,7 +114,6 @@ train_state = jax.jit(lambda r, p: init_fn(rng=r, params=p), out_shardings=train
 del params
 print("Memory usage train_state:", get_memory_usage(), "GB")
 
-# jax.debug.visualize_array_sharding(train_state.params['Block_0']['Dense_0']['kernel'])
 tokenizer = create_tokenizer(ckpt_dir)
 pad_id = tokenizer.get_pad_token_id()
 
