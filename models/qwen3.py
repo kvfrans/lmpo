@@ -141,21 +141,6 @@ class KVCache(flax.struct.PyTreeNode):
         # Yes, the type annotations are wrong, but this works nicely for jax sharding...
         return KVCache(k=cache_shard, v=cache_shard, length=none_shard, starts=cache_shard)
 
-
-# class MLPBlock(nn.Module):
-#     hidden_size: int
-#     mlp_ffw_size: int
-    
-#     @nn.checkpoint
-#     @nn.compact
-#     def __call__(self, x):
-#         g = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(x)
-#         g = nn.silu(g)
-#         y = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(x)
-#         y = g * y
-#         mlp_x = nn.Dense(features=self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(y)
-#         return mlp_x
-
 class Block(nn.Module):
     """ A standard transformer block. Has residual connection, self-attention, and a two-layer MLP. """
     hidden_size: int
@@ -164,9 +149,10 @@ class Block(nn.Module):
     head_dim: int
     mlp_ffw_size: int
     eps: float = 1e-6
+    use_flash_attn: bool = True
 
     @nn.compact
-    def __call__(self, x_in, sin_in, cos_in, mask_in, token_mask_in, layer_id_in, cache_in=None):
+    def __call__(self, x, sin, cos, mask, token_mask, layer_id, cache=None):
         # We define the params out here in case we want to transform block_fwd with jax.remat.
 
         pre_gamma = self.param('pre_gamma', nn.initializers.constant(1.0), (self.hidden_size,))
@@ -174,72 +160,61 @@ class Block(nn.Module):
         k_gamma = self.param('k_gamma', nn.initializers.constant(1.0), (self.head_dim,))
         post_gamma = self.param('post_gamma', nn.initializers.constant(1.0), (self.hidden_size,))
 
-        def block_fwd(x, sin, cos, mask, token_mask, layer_id, cache):
-            # =========================
-            # === Self-Attention Block. 
-            # =========================
+        # =========================
+        # === Self-Attention Block. 
+        # =========================
 
-            x_norm = rms_norm(x, pre_gamma, self.eps)
-            
-            # Calculate Q,K,V.
-            q = nn.Dense(self.q_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(x_norm)
-            q = jnp.reshape(q, (q.shape[0], q.shape[1], self.q_heads, self.head_dim)) # (batch, seq_len, q_heads, head_dim)
-            k = nn.Dense(self.kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(x_norm)
-            k = jnp.reshape(k, (k.shape[0], k.shape[1], self.kv_heads, self.head_dim))
-            v = nn.Dense(self.kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(x_norm)
-            v = jnp.reshape(v, (v.shape[0], v.shape[1], self.kv_heads, self.head_dim))
+        x_norm = rms_norm(x, pre_gamma, self.eps)
+        
+        # Calculate Q,K,V.
+        q = nn.Dense(self.q_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(x_norm)
+        q = jnp.reshape(q, (q.shape[0], q.shape[1], self.q_heads, self.head_dim)) # (batch, seq_len, q_heads, head_dim)
+        k = nn.Dense(self.kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(x_norm)
+        k = jnp.reshape(k, (k.shape[0], k.shape[1], self.kv_heads, self.head_dim))
+        v = nn.Dense(self.kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(x_norm)
+        v = jnp.reshape(v, (v.shape[0], v.shape[1], self.kv_heads, self.head_dim))
 
-            q = rms_norm(q, q_gamma, self.eps)
-            q = apply_rotary_embedding(q, sin, cos)
-            k = rms_norm(k, k_gamma, self.eps)
-            k = apply_rotary_embedding(k, sin, cos)
+        q = rms_norm(q, q_gamma, self.eps)
+        q = apply_rotary_embedding(q, sin, cos)
+        k = rms_norm(k, k_gamma, self.eps)
+        k = apply_rotary_embedding(k, sin, cos)
 
-            if cache is not None:
-                k = jax.lax.dynamic_update_slice_in_dim(cache.k[layer_id], k, cache.length, axis=1)
-                v = jax.lax.dynamic_update_slice_in_dim(cache.v[layer_id], v, cache.length, axis=1)
+        if cache is not None:
+            k = jax.lax.dynamic_update_slice_in_dim(cache.k[layer_id], k, cache.length, axis=1)
+            v = jax.lax.dynamic_update_slice_in_dim(cache.v[layer_id], v, cache.length, axis=1)
 
-            if cache is None:
-                # Flash attention for training.
-                qkv = flash_attention(q,k,v,token_mask)
-                qkv = jnp.reshape(qkv, (qkv.shape[0], qkv.shape[1], self.q_heads * self.head_dim))
-            else:
-                # Naive attention for inference.
-                b, t, qh, d = q.shape # qh = 16
-                _, T, kh, _ = k.shape # kh = 8
-                q = jnp.reshape(q, (b, t, kh, qh // kh, d))
-                qk = jnp.einsum("bthgd,bThd->btThg", q, k) * (d ** -0.5)
-                qk = jnp.reshape(qk, (b, t, T, qh)) 
-                qk = jnp.where(mask, qk, -1e30) # good
-                attn = jax.nn.softmax(qk.astype(jnp.float32), axis=2) # on T dimension.
-                attn = jnp.reshape(attn, (b, t, T, kh, qh // kh))
-                qkv = jnp.einsum("btThg,bThd->bthgd", attn, v).astype(x.dtype)
-                qkv = jnp.reshape(qkv, (b, t, qh*d))
+        if cache is None and self.use_flash_attn:
+            # Flash attention for training.
+            qkv = flash_attention(q,k,v,token_mask)
+            qkv = jnp.reshape(qkv, (qkv.shape[0], qkv.shape[1], self.q_heads * self.head_dim))
+        else:
+            # Naive attention for inference.
+            b, t, qh, d = q.shape # qh = 16
+            _, T, kh, _ = k.shape # kh = 8
+            q = jnp.reshape(q, (b, t, kh, qh // kh, d))
+            qk = jnp.einsum("bthgd,bThd->btThg", q, k) * (d ** -0.5)
+            qk = jnp.reshape(qk, (b, t, T, qh)) 
+            qk = jnp.where(mask, qk, -1e30) # good
+            attn = jax.nn.softmax(qk.astype(jnp.float32), axis=2) # on T dimension.
+            attn = jnp.reshape(attn, (b, t, T, kh, qh // kh))
+            qkv = jnp.einsum("btThg,bThd->bthgd", attn, v).astype(x.dtype)
+            qkv = jnp.reshape(qkv, (b, t, qh*d))
 
-            attn_x = nn.Dense(self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(qkv)
-            x = x + attn_x
-            
-            # =========================
-            # === MLP Block. 
-            # =========================
-            x_norm = rms_norm(x, post_gamma, self.eps)
-            # mlp_x = MLPBlock(hidden_size=self.hidden_size, mlp_ffw_size=self.mlp_ffw_size)(x_norm)
+        attn_x = nn.Dense(self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(qkv)
+        x = x + attn_x
+        
+        # =========================
+        # === MLP Block. 
+        # =========================
+        x_norm = rms_norm(x, post_gamma, self.eps)
+        g = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(x_norm)
+        g = nn.silu(g)
+        y = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(x_norm)
+        y = g * y
+        mlp_x = nn.Dense(features=self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(y)
 
-            # @jax.remat
-            # def mlp_block(xi):
-            g = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(x_norm)
-            g = nn.silu(g)
-            y = nn.Dense(features=self.mlp_ffw_size, use_bias=False, dtype=jnp.bfloat16)(x_norm)
-            y = g * y
-            mlp_x = nn.Dense(features=self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(y)
-            #     return mlp_x
-            # mlp_x = mlp_block(x_norm)
-
-            x = x + mlp_x
-            return x, k, v
-        # if self.use_remat:
-        #     return jax.remat(block_fwd, static_argnums=5)(x_in, sin_in, cos_in, mask_in, token_mask_in, layer_id_in, cache_in)
-        # else:
-        return block_fwd(x_in, sin_in, cos_in, mask_in, token_mask_in, layer_id_in, cache_in)
+        x = x + mlp_x
+        return x, k, v
 
 class Qwen3Model(nn.Module):
     hidden_size: int

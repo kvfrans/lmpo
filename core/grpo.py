@@ -39,10 +39,11 @@ config = ml_collections.ConfigDict({
     'entropy_coef': 0.001,
     'kl_coef': 0.001,
     'weight_decay': 1e-2,
-    'use_remat': 0,
     'train_vocab': 1,
-    # Non-training settings.
+    # Compute graph settings
     'sharding': 'fsdp',
+    'use_remat': 1,
+    'use_flash_attn': 1,
     'use_xla_flags': 1,
     # For offline data collection.
     'do_save_rollouts': 0,
@@ -252,219 +253,210 @@ total_rollouts = 0
 
 if jax.process_index() == 0 and FLAGS.profile:
     print("Profiling enabled, saving.")
-# with jax.profiler.trace('/mount/code/dqlm/lmpo/tensorboard') if jax.process_index() == 0 and FLAGS.profile else contextlib.nullcontext():
-with contextlib.nullcontext():
-    for i in tqdm.tqdm(range(FLAGS.max_steps)):
+for i in tqdm.tqdm(range(FLAGS.max_steps)):
 
-        # Fill this global on-policy buffer with groups that have A != 0.
-        buffer_tokens = []
-        buffer_inference_logprobs = []
-        buffer_advantages = []
-        env_infos_history = {}
-        env_infos_history['return'] = []
-        num_rollout_iters = 0
-        rollout_start_time = time.time()
-        while len(buffer_tokens) < FLAGS.groups_per_batch:
-            num_rollout_iters += 1
-            total_rollouts += rollout_batch_size * jax.process_count()
-            env_states, env_tokens = [], []
-            for _ in range(rollout_batch_size // FLAGS.group_size):
-                env_state, output_tokens = env.reset(min(env_task_idx + jax.process_index(), env_num_tasks-1))
-                env_task_idx += jax.process_count()
-                env_task_idx = env_task_idx % env_num_tasks
-                for _ in range(FLAGS.group_size):
-                    env_states.append(env_state)
-                    env_tokens.append(output_tokens)
+    # Fill this global on-policy buffer with groups that have A != 0.
+    buffer_tokens = []
+    buffer_inference_logprobs = []
+    buffer_advantages = []
+    env_infos_history = {}
+    env_infos_history['return'] = []
+    num_rollout_iters = 0
+    rollout_start_time = time.time()
+    while len(buffer_tokens) < FLAGS.groups_per_batch:
+        num_rollout_iters += 1
+        total_rollouts += rollout_batch_size * jax.process_count()
+        env_states, env_tokens = [], []
+        for _ in range(rollout_batch_size // FLAGS.group_size):
+            env_state, output_tokens = env.reset(min(env_task_idx + jax.process_index(), env_num_tasks-1))
+            env_task_idx += jax.process_count()
+            env_task_idx = env_task_idx % env_num_tasks
+            for _ in range(FLAGS.group_size):
+                env_states.append(env_state)
+                env_tokens.append(output_tokens)
 
-            prompt_tokens = pad_and_collate(env_tokens, pad_id=pad_id, force_length=FLAGS.prompt_length)
-            prompt_tokens = shard_data_fn(prompt_tokens)
-            num_generation_tokens = FLAGS.num_generation_tokens
-            rng, key = jax.random.split(rng)
-            action_tokens, action_logprobs = autoregressive_sample(
-                train_state.model_def, train_state.params, prompt_tokens, rng=key, num_generation_tokens=num_generation_tokens, 
-                pad_id=pad_id, data_shard=data_shard_dp, no_shard=no_shard, params_shard=no_shard, force_answer_at=FLAGS.force_answer_at, 
-                prefill_batch_split=FLAGS.prefill_batch_split, return_logprobs=True
-            )
-            prompt_tokens = host_gather(prompt_tokens)
-            action_tokens = host_gather(action_tokens)
-            all_tokens = jnp.concatenate([prompt_tokens, action_tokens], axis=-1)
-            all_logprobs = jnp.concatenate([jnp.zeros_like(prompt_tokens), action_logprobs], axis=-1)
+        prompt_tokens = pad_and_collate(env_tokens, pad_id=pad_id, force_length=FLAGS.prompt_length)
+        prompt_tokens = shard_data_fn(prompt_tokens)
+        num_generation_tokens = FLAGS.num_generation_tokens
+        rng, key = jax.random.split(rng)
+        action_tokens, action_logprobs = autoregressive_sample(
+            train_state.model_def, train_state.params, prompt_tokens, rng=key, num_generation_tokens=num_generation_tokens, 
+            pad_id=pad_id, data_shard=data_shard_dp, no_shard=no_shard, params_shard=no_shard, force_answer_at=FLAGS.force_answer_at, 
+            prefill_batch_split=FLAGS.prefill_batch_split, return_logprobs=True
+        )
+        prompt_tokens = host_gather(prompt_tokens)
+        action_tokens = host_gather(action_tokens)
+        all_tokens = jnp.concatenate([prompt_tokens, action_tokens], axis=-1)
+        all_logprobs = jnp.concatenate([jnp.zeros_like(prompt_tokens), action_logprobs], axis=-1)
 
-            action_tokens_local = get_local_slice(action_tokens, data_shard_dp.mesh)
-            new_states, _, returns_local, dones, env_infos = env.step_list(env_states, [t.tolist() for t in action_tokens_local])
-            assert dones[0] # Only supports bandit envs for now.
-            returns_local = np.array(returns_local)
-            returns = host_gather(shard_data_fn(returns_local))
-            for k, v in env_infos.items():
-                if k not in env_infos_history:
-                    env_infos_history[k] = []
-                v_global = host_gather(shard_data_fn(np.array(v)))
-                env_infos_history[k] += v_global.tolist()
-            env_infos_history['return'] += returns.tolist()
+        action_tokens_local = get_local_slice(action_tokens, data_shard_dp.mesh)
+        new_states, _, returns_local, dones, env_infos = env.step_list(env_states, [t.tolist() for t in action_tokens_local])
+        assert dones[0] # Only supports bandit envs for now.
+        returns_local = np.array(returns_local)
+        returns = host_gather(shard_data_fn(returns_local))
+        for k, v in env_infos.items():
+            if k not in env_infos_history:
+                env_infos_history[k] = []
+            v_global = host_gather(shard_data_fn(np.array(v)))
+            env_infos_history[k] += v_global.tolist()
+        env_infos_history['return'] += returns.tolist()
 
-            mask_size = prompt_tokens.shape[-1]
+        mask_size = prompt_tokens.shape[-1]
 
-            if FLAGS.do_save_rollouts and jax.process_index() == 0:
-                rollouts_buffer_prompts.append(np.array(prompt_tokens))
-                rollouts_buffer_actions.append(np.array(action_tokens))
-                rollouts_buffer_returns.append(np.array(returns))
-                if len(rollouts_buffer_prompts) > 100:
-                    print("Saving rollouts buffer to disk...")
-                    np.savez_compressed(FLAGS.save_dir + f'{FLAGS.save_rollouts_dir}/rollouts_buffer_{rollouts_buffer_iter}.npz',
-                                        prompts=np.concatenate(rollouts_buffer_prompts, axis=0),
-                                        actions=np.concatenate(rollouts_buffer_actions, axis=0),
-                                        returns=np.concatenate(rollouts_buffer_returns, axis=0))
-                    rollouts_buffer_prompts = []
-                    rollouts_buffer_actions = []
-                    rollouts_buffer_returns = []
-                    rollouts_buffer_iter += 1
+        if FLAGS.do_save_rollouts and jax.process_index() == 0:
+            rollouts_buffer_prompts.append(np.array(prompt_tokens))
+            rollouts_buffer_actions.append(np.array(action_tokens))
+            rollouts_buffer_returns.append(np.array(returns))
+            if len(rollouts_buffer_prompts) > 100:
+                print("Saving rollouts buffer to disk...")
+                np.savez_compressed(FLAGS.save_dir + f'{FLAGS.save_rollouts_dir}/rollouts_buffer_{rollouts_buffer_iter}.npz',
+                                    prompts=np.concatenate(rollouts_buffer_prompts, axis=0),
+                                    actions=np.concatenate(rollouts_buffer_actions, axis=0),
+                                    returns=np.concatenate(rollouts_buffer_returns, axis=0))
+                rollouts_buffer_prompts = []
+                rollouts_buffer_actions = []
+                rollouts_buffer_returns = []
+                rollouts_buffer_iter += 1
 
-            # Advantage calculation.
-            returns = jnp.reshape(returns, (-1, FLAGS.group_size))
-            advantages = returns
-            if FLAGS.do_group_normalization:
-                group_mean = np.mean(advantages, axis=-1)
-                group_std = np.std(advantages, axis=-1) + 1e-8
-                advantages = (advantages - group_mean[:, None]) / group_std[:, None]
-            if FLAGS.do_global_normalization:
-                global_mean = np.mean(advantages)
-                global_std = np.std(advantages) + 1e-8
-                advantages = (advantages - global_mean) / global_std
-            if FLAGS.do_clip_advantages:
-                advantages = np.clip(advantages, a_min=0, a_max=None)
-            advantages_grouped = advantages # [batch_size // group_size, group_size]
-            all_tokens_grouped = all_tokens.reshape(-1, FLAGS.group_size, all_tokens.shape[-1])
-            all_logprobs_grouped = all_logprobs.reshape(-1, FLAGS.group_size, all_logprobs.shape[-1])
+        # Advantage calculation.
+        returns = jnp.reshape(returns, (-1, FLAGS.group_size))
+        advantages = returns
+        if FLAGS.do_group_normalization:
+            group_mean = np.mean(advantages, axis=-1)
+            group_std = np.std(advantages, axis=-1) + 1e-8
+            advantages = (advantages - group_mean[:, None]) / group_std[:, None]
+        if FLAGS.do_global_normalization:
+            global_mean = np.mean(advantages)
+            global_std = np.std(advantages) + 1e-8
+            advantages = (advantages - global_mean) / global_std
+        if FLAGS.do_clip_advantages:
+            advantages = np.clip(advantages, a_min=0, a_max=None)
+        advantages_grouped = advantages # [batch_size // group_size, group_size]
+        all_tokens_grouped = all_tokens.reshape(-1, FLAGS.group_size, all_tokens.shape[-1])
+        all_logprobs_grouped = all_logprobs.reshape(-1, FLAGS.group_size, all_logprobs.shape[-1])
 
-            for group_idx in range(advantages_grouped.shape[0]):
-                if np.all(advantages_grouped[group_idx, :] == 0) and FLAGS.do_group_filter:
-                    continue
-                else:
-                    buffer_tokens.append(all_tokens_grouped[group_idx, :])
-                    buffer_advantages.append(advantages_grouped[group_idx, :])
-                    buffer_inference_logprobs.append(all_logprobs_grouped[group_idx, :])
-            print(f"Buffer size: {len(buffer_tokens) * FLAGS.group_size}. Return avg: {np.mean(returns)}")
-            if jax.process_index() == 0:
-                print(env.render(new_states[0]))
+        for group_idx in range(advantages_grouped.shape[0]):
+            if np.all(advantages_grouped[group_idx, :] == 0) and FLAGS.do_group_filter:
+                continue
+            else:
+                buffer_tokens.append(all_tokens_grouped[group_idx, :])
+                buffer_advantages.append(advantages_grouped[group_idx, :])
+                buffer_inference_logprobs.append(all_logprobs_grouped[group_idx, :])
+        print(f"Buffer size: {len(buffer_tokens) * FLAGS.group_size}. Return avg: {np.mean(returns)}")
+        if jax.process_index() == 0:
+            print(env.render(new_states[0]))
 
-        rollout_total_time = time.time() - rollout_start_time
+    rollout_total_time = time.time() - rollout_start_time
 
-        def ppo_shard(x):
-            """Helper function that takes a local buffer, shards across devices, then splits into PPO minibatches."""
-            host_id = jax.process_index()
-            host_slice = FLAGS.ppo_minibatch // jax.process_count()
-            x = jnp.reshape(x, (FLAGS.ppo_minibatch, -1, *x.shape[1:]))
-            x = x[host_id * host_slice : (host_id + 1) * host_slice, :]
-            x = shard_data_fn(x)
-            return x # [ppo_minibatch, num_minibatches (j), ...] where first dim is sharded.
+    def ppo_shard(x):
+        """Helper function that takes a local buffer, shards across devices, then splits into PPO minibatches."""
+        host_id = jax.process_index()
+        host_slice = FLAGS.ppo_minibatch // jax.process_count()
+        x = jnp.reshape(x, (FLAGS.ppo_minibatch, -1, *x.shape[1:]))
+        x = x[host_id * host_slice : (host_id + 1) * host_slice, :]
+        x = shard_data_fn(x)
+        return x # [ppo_minibatch, num_minibatches (j), ...] where first dim is sharded.
 
-        # The buffer is syncronized among hosts.
-        tokens_all = jnp.concatenate(buffer_tokens, axis=0)
-        advantages = jnp.concatenate(buffer_advantages, axis=0)
-        inference_logprobs_all = jnp.concatenate(buffer_inference_logprobs, axis=0)
-        global_batch_size = FLAGS.groups_per_batch * FLAGS.group_size
-        print(f"Clipping total buffer of {tokens_all.shape[0]} to global batch size {global_batch_size}.")
-        tokens_all = tokens_all[:global_batch_size]
-        advantages = advantages[:global_batch_size]
-        inference_logprobs_all = inference_logprobs_all[:global_batch_size]
+    # The buffer is syncronized among hosts.
+    tokens_all = jnp.concatenate(buffer_tokens, axis=0)
+    advantages = jnp.concatenate(buffer_advantages, axis=0)
+    inference_logprobs_all = jnp.concatenate(buffer_inference_logprobs, axis=0)
+    global_batch_size = FLAGS.groups_per_batch * FLAGS.group_size
+    print(f"Clipping total buffer of {tokens_all.shape[0]} to global batch size {global_batch_size}.")
+    tokens_all = tokens_all[:global_batch_size]
+    advantages = advantages[:global_batch_size]
+    inference_logprobs_all = inference_logprobs_all[:global_batch_size]
 
-        # Mask = False for all prompt tokens, and tokens after <|im_end|> token.
-        mask = (jnp.arange(tokens_all.shape[-1]) >= mask_size - 1)[None, :]
-        eos_idx = jnp.argmax(tokens_all[:, mask_size:] == tokenizer.get_eos_token_id(), axis=-1)
-        eos_idx = jnp.where(eos_idx == 0, tokens_all.shape[-1], eos_idx)
-        mask = mask & (jnp.arange(tokens_all.shape[-1])[None, :] <= eos_idx[:, None] + mask_size)
+    # Mask = False for all prompt tokens, and tokens after <|im_end|> token.
+    mask = (jnp.arange(tokens_all.shape[-1]) >= mask_size - 1)[None, :]
+    eos_idx = jnp.argmax(tokens_all[:, mask_size:] == tokenizer.get_eos_token_id(), axis=-1)
+    eos_idx = jnp.where(eos_idx == 0, tokens_all.shape[-1], eos_idx)
+    mask = mask & (jnp.arange(tokens_all.shape[-1])[None, :] <= eos_idx[:, None] + mask_size)
 
-        tokens_all_minibatch = ppo_shard(tokens_all)
-        advantages_minibatch = ppo_shard(advantages)
-        inference_logprobs_all_minibatch = ppo_shard(inference_logprobs_all)
-        mask_minibatch = ppo_shard(mask)
+    tokens_all_minibatch = ppo_shard(tokens_all)
+    advantages_minibatch = ppo_shard(advantages)
+    inference_logprobs_all_minibatch = ppo_shard(inference_logprobs_all)
+    mask_minibatch = ppo_shard(mask)
 
-        # First, we do a forward pass to get prior logprobs for each token.
-        logprobs_list = []
+    # First, we do a forward pass to get prior logprobs for each token.
+    logprobs_list = []
+    for j in range(global_batch_size // FLAGS.ppo_minibatch):
+        logprobs_minibatch = get_logprobs(train_state, tokens_all_minibatch[:, j], mask_minibatch[:, j])
+        logprobs_list.append(logprobs_minibatch)
+    logprobs_all_minibatch = jnp.stack(logprobs_list, axis=1)
+
+    # Then, the training loop.
+    update_time_start = time.time()
+    with jax.profiler.trace('/mount/code/dqlm/lmpo/tensorboard') if jax.process_index() == 0 and FLAGS.profile else contextlib.nullcontext():
         for j in range(global_batch_size // FLAGS.ppo_minibatch):
-            logprobs_minibatch = get_logprobs(train_state, tokens_all_minibatch[:, j], mask_minibatch[:, j])
-            logprobs_list.append(logprobs_minibatch)
-        logprobs_all_minibatch = jnp.stack(logprobs_list, axis=1)
-
-        # Then, the training loop.
-        update_time_start = time.time()
-        with jax.profiler.trace('/mount/code/dqlm/lmpo/tensorboard') if jax.process_index() == 0 and FLAGS.profile else contextlib.nullcontext():
-            for j in range(global_batch_size // FLAGS.ppo_minibatch):
-                print("Memory usage before update:", get_memory_usage(), "GB")
-                train_state, info = update(train_state, tokens_all_minibatch[:, j], mask_minibatch[:, j], advantages_minibatch[:, j], 
-                                        logprobs_all_minibatch[:, j], inference_logprobs_all_minibatch[:, j])
-                
-                # compiled_step = update.lower(train_state, tokens_all_minibatch[:, j], mask_minibatch[:, j], advantages_minibatch[:, j], 
-                #                         logprobs_all_minibatch[:, j], inference_logprobs_all_minibatch[:, j]).compile()
-                # compiled_stats = compiled_step.memory_analysis()
-                # if compiled_stats is not None:
-                #     total = compiled_stats.temp_size_in_bytes + compiled_stats.argument_size_in_bytes \
-                #         + compiled_stats.output_size_in_bytes - compiled_stats.alias_size_in_bytes
-                #     print(f"Temp size: {compiled_stats.temp_size_in_bytes / (1024**3):.2f} GB")
-                #     print(f"Argument size: {compiled_stats.argument_size_in_bytes / (1024**3):.2f} GB")
-                #     print(f"Output size: {compiled_stats.output_size_in_bytes / (1024**3):.2f} GB")
-                #     print(f"Total size: {total / (1024**3):.2f} GB")
-
-                info = jax.device_get(info)
-                info['output_tokens'] = eos_idx
-                info = jax.tree.map(lambda x: np.array(x), info)
-                info = jax.tree.map(lambda x: x.mean(), info)
-                info['total_rollouts'] = total_rollouts
-                if env.num_tasks != -1:
-                    info['env_epochs'] = total_rollouts / env_num_tasks
-                info['rollout_iters_per_update'] = num_rollout_iters
-                info['global_step'] = i
-                info['times/time_per_inference_iteration'] = rollout_total_time / num_rollout_iters
-                info['times/time_per_rollout'] = rollout_total_time / (num_rollout_iters * rollout_batch_size * jax.host_count())
-                info['times/time_per_effective_rollout'] = rollout_total_time / global_batch_size
-                info['times/total_time_rollouts'] = rollout_total_time
-                info['times/total_time_update'] = time.time() - update_time_start
-                info['effective_rollout_ratio'] = global_batch_size / (rollout_batch_size * jax.host_count() * num_rollout_iters)
-                info['minibatches_per_global_step'] = global_batch_size // FLAGS.ppo_minibatch
-                for k, v in env_infos_history.items():
-                    info['env/'+k] = np.mean(v)
-                if jax.process_index() == 0:
-                    rollouts_list.append([i, env.render(new_states[0]), returns_local[0]])
-                    if i % 100 == 0 and j == 0:
-                        rollouts_table = wandb.Table(data=rollouts_list, columns=["step", "text", "reward"])
-                        info['rollouts_table'] = rollouts_table
-                    if j == global_batch_size // FLAGS.ppo_minibatch - 1:
-                        print(f'=================== Iter {i} ===================')
-                        for k, v in info.items():
-                            if k not in ['rollouts_table']:
-                                print(f"{k}: {v}")
-                    wandb.log(info)
-
-        if i % FLAGS.test_interval == 0 and env_test is not None:
-            _, test_env_history = eval_model(
-                model=train_state.model_def,
-                params=train_state.params,
-                env=env_test,
-                num_generation_tokens=FLAGS.num_generation_tokens,
-                force_answer_at=FLAGS.force_answer_at,
-                prompt_length=FLAGS.prompt_length,
-                inference_batch_per_device=FLAGS.inference_batch_per_device,
-                pad_id=pad_id,
-                shard_data_fn=shard_data_fn,
-                no_shard=no_shard,
-                data_shard=data_shard,
-                num_epochs=1,
-            )
-            test_info = {f'test_env/{k}': np.mean(v) for k, v in test_env_history.items()}
+            print("Memory usage before update:", get_memory_usage(), "GB")
+            pre_update_time = time.time()
+            train_state, info = update(train_state, tokens_all_minibatch[:, j], mask_minibatch[:, j], advantages_minibatch[:, j], 
+                                    logprobs_all_minibatch[:, j], inference_logprobs_all_minibatch[:, j])
+            
+            info = jax.device_get(info)
+            info['output_tokens'] = eos_idx
+            info['times/time_single_update'] = time.time() - pre_update_time
+            info = jax.tree.map(lambda x: np.array(x), info)
+            info = jax.tree.map(lambda x: x.mean(), info)
+            for k, v in env_infos_history.items():
+                info['env/'+k] = np.mean(v)
             if jax.process_index() == 0:
-                wandb.log(test_info, commit=False)
+                rollouts_list.append([i, env.render(new_states[0]), returns_local[0]])
+                if i % 100 == 0 and j == 0:
+                    rollouts_table = wandb.Table(data=rollouts_list, columns=["step", "text", "reward"])
+                    info['rollouts_table'] = rollouts_table
+                if j == global_batch_size // FLAGS.ppo_minibatch - 1:
 
-        # This only saves the params. If you want to save the optimizer, gather the whole train_state.
-        if i % FLAGS.save_interval == 0 and FLAGS.save_dir != "":
-            params_gather = host_gather(train_state.params)
-            if jax.process_index() == 0:
-                step_dir = FLAGS.save_dir + '/step' + str(i ) + '/'
-                cp = Checkpoint(step_dir + 'params.pkl', parallel=False)
-                cp.params = params_gather
-                cp.save()
-                del cp
-                shutil.copy(FLAGS.model_dir + 'config.json', step_dir + 'config.json')
-                shutil.copy(FLAGS.model_dir + 'tokenizer_config.json', step_dir + 'tokenizer_config.json')
-                shutil.copy(FLAGS.model_dir + 'tokenizer.json', step_dir + 'tokenizer.json')
+                    info['total_rollouts'] = total_rollouts
+                    if env.num_tasks != -1:
+                        info['env_epochs'] = total_rollouts / env_num_tasks
+                    info['rollout_iters_per_update'] = num_rollout_iters
+                    info['global_step'] = i
+                    info['times/time_per_inference_iteration'] = rollout_total_time / num_rollout_iters
+                    info['times/time_per_rollout'] = rollout_total_time / (num_rollout_iters * rollout_batch_size * jax.host_count())
+                    info['times/time_per_effective_rollout'] = rollout_total_time / global_batch_size
+                    info['times/total_time_rollouts'] = rollout_total_time
+                    info['times/total_time_update'] = time.time() - update_time_start
+                    info['effective_rollout_ratio'] = global_batch_size / (rollout_batch_size * jax.host_count() * num_rollout_iters)
+                    info['minibatches_per_global_step'] = global_batch_size // FLAGS.ppo_minibatch
 
-            del params_gather
+                    print(f'=================== Iter {i} ===================')
+                    for k, v in info.items():
+                        if k not in ['rollouts_table']:
+                            print(f"{k}: {v}")
+                wandb.log(info)
+
+    if i % FLAGS.test_interval == 0 and env_test is not None:
+        _, test_env_history = eval_model(
+            model=train_state.model_def,
+            params=train_state.params,
+            env=env_test,
+            num_generation_tokens=FLAGS.num_generation_tokens,
+            force_answer_at=FLAGS.force_answer_at,
+            prompt_length=FLAGS.prompt_length,
+            inference_batch_per_device=FLAGS.inference_batch_per_device,
+            pad_id=pad_id,
+            shard_data_fn=shard_data_fn,
+            no_shard=no_shard,
+            data_shard=data_shard,
+            num_epochs=1,
+        )
+        test_info = {f'test_env/{k}': np.mean(v) for k, v in test_env_history.items()}
+        if jax.process_index() == 0:
+            wandb.log(test_info, commit=False)
+
+    # This only saves the params. If you want to save the optimizer, gather the whole train_state.
+    if i % FLAGS.save_interval == 0 and FLAGS.save_dir != "":
+        params_gather = host_gather(train_state.params)
+        if jax.process_index() == 0:
+            step_dir = FLAGS.save_dir + '/step' + str(i ) + '/'
+            cp = Checkpoint(step_dir + 'params.pkl', parallel=False)
+            cp.params = params_gather
+            cp.save()
+            del cp
+            shutil.copy(FLAGS.model_dir + 'config.json', step_dir + 'config.json')
+            shutil.copy(FLAGS.model_dir + 'tokenizer_config.json', step_dir + 'tokenizer_config.json')
+            shutil.copy(FLAGS.model_dir + 'tokenizer.json', step_dir + 'tokenizer.json')
+
+        del params_gather

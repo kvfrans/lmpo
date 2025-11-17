@@ -5,6 +5,7 @@ import jax
 from functools import partial
 import time
 import tqdm
+import contextlib
 
 from lmpo.utils.sharding import host_gather, get_memory_usage
 from lmpo.models.qwen3 import Qwen3Model, KVCache, count_left_padding
