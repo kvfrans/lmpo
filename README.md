@@ -28,6 +28,7 @@ First, you will want to install the dependencies:
 ```bash
 pip install numpy absl-py ml-collections wandb einops jaxtyping opt-einsum transformers tqdm jax==0.6.1 jaxlib==0.6.1 optax==0.2.5 flax==0.10.6 chex==0.1.89
 # You may need to install "jax[cuda12]" or "jax[tpu]" depending on your system.
+# For gpus, you may need triton==3.2.0 for flash attention.
 ```
 
 Then, download the Qwen checkpoints and convert into a Jax checkpoint.

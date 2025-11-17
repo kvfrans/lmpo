@@ -1,3 +1,12 @@
+import os
+# This flag is important when using FSDP to prevent excessive communication buffers.
+# Must be set before jax is imported.
+os.environ['LIBTPU_INIT_ARGS'] = '--xla_tpu_enable_latency_hiding_scheduler=false --xla_should_allow_loop_variant_parameter_in_chain=enabled --xla_should_add_loop_invariant_op_in_chain=enabled --xla_tpu_enable_ici_ag_pipelining=true'
+
+import ml_collections
+from absl import app, flags;
+import sys
+from lmpo.utils.configs import define_flag_dict
 import jax.numpy as jnp
 import jax
 import numpy as np
@@ -5,11 +14,11 @@ import tqdm
 import optax
 from functools import partial
 import wandb
-import ml_collections
-import sys
 import time
 import shutil
-from absl import app, flags
+
+import contextlib
+from jax.ad_checkpoint import print_saved_residuals
 
 try: # If you like to use these helpers, you can.
     from jax.experimental.compilation_cache import compilation_cache as cc
@@ -20,7 +29,6 @@ except:
     pass
 
 from lmpo.models.qwen3 import create_model_from_ckpt
-from lmpo.utils.configs import define_flag_dict
 from lmpo.utils.wandb import setup_wandb
 from lmpo.envs.env_creator import create_env
 from lmpo.utils.sharding import create_sharding, host_gather, get_memory_usage, get_local_slice
@@ -37,6 +45,7 @@ config = ml_collections.ConfigDict({
     'model_dir': '/gcs/jaxconverted/Qwen3-1.7B/',
     'save_dir': "",
     'save_interval': 20,
+    'max_steps': 10000,
     # env settings.
     'env_name': 'poem', # (poem, gsm8k, countdown)
     'num_generation_tokens': -1, # -1 = use default from env.
@@ -65,15 +74,25 @@ config = ml_collections.ConfigDict({
     'entropy_coef': 0.001,
     'kl_coef': 0.001,
     'weight_decay': 1e-2,
-    # Non-training settings.
-    'sharding': 'tfsdp',
+    'train_vocab': 1,
+    # Compute graph settings
+    'sharding': 'fsdp',
+    'use_remat': 1,
+    'use_flash_attn': 1,
+    'use_xla_flags': 1,
     # For offline data collection.
     'do_save_rollouts': 0,
     'save_rollouts_dir': 'rollouts/',
+    'profile': 0, 
 })
+
 define_flag_dict(config)
 FLAGS = flags.FLAGS
 FLAGS(sys.argv)
+
+if not FLAGS.use_xla_flags:
+    assert "Disable the XLS flags manually if you want to set use_xla_flags to False."
+
 if jax.process_index() == 0:
     setup_wandb(FLAGS.flag_values_dict(), project=FLAGS.wandb_project, name=FLAGS.env_name+'-'+FLAGS.wandb_name, group=FLAGS.wandb_group)
     rollouts_list = []
@@ -81,7 +100,7 @@ if jax.process_index() == 0:
 host_id = jax.process_index()
                                           
 ckpt_dir = FLAGS.model_dir
-model, params = create_model_from_ckpt(ckpt_dir)
+model, params = create_model_from_ckpt(ckpt_dir, use_remat=bool(FLAGS.use_remat))
 tx = optax.chain(
     optax.clip_by_global_norm(1.0),
     optax.adamw(FLAGS.lr, b1=0.9, b2=0.95, weight_decay=FLAGS.weight_decay),
@@ -90,12 +109,11 @@ rng = jax.random.PRNGKey(0)
 print("Memory usage pre-init:", get_memory_usage(), "GB")
 init_fn = partial(TrainState.create_with_params, model_def=model, tx=tx, use_ema=False)
 train_state_shape = jax.eval_shape(init_fn, rng=rng, params=params)
-train_state_shard, no_shard, data_shard, data_shard_dp, shard_data_fn  = create_sharding(FLAGS.sharding, train_state_shape)
+train_state_shard, no_shard, data_shard, data_shard_dp, shard_data_fn = create_sharding(FLAGS.sharding, train_state_shape)
 train_state = jax.jit(lambda r, p: init_fn(rng=r, params=p), out_shardings=train_state_shard)(rng, params)
 del params
 print("Memory usage train_state:", get_memory_usage(), "GB")
 
-jax.debug.visualize_array_sharding(train_state.params['Block_0']['Dense_0']['kernel'])
 tokenizer = create_tokenizer(ckpt_dir)
 pad_id = tokenizer.get_pad_token_id()
 
@@ -122,27 +140,34 @@ if FLAGS.do_save_rollouts:
 @jax.jit
 def get_logprobs(train_state: TrainState, token_batch, mask):
     print("JIT compiling logprob function for token_batch of shape", token_batch.shape)
-    text_input, text_target = token_batch[:, :-1], token_batch[:, 1:]
+    text_target = token_batch[:, 1:]
     mask = mask[:, 1:]
-    token_mask = jnp.where(text_input != pad_id, 1, 0).astype(jnp.int32)
-    logits, _ = train_state.call_model(text_input, token_mask, cache=None)
+    token_mask = jnp.where(token_batch != pad_id, 1, 0).astype(jnp.int32)
+    logits, _ = train_state.call_model(token_batch, token_mask, cache=None)
+    logits = logits[:, :-1, :]  # [batch, time-1, vocab_size]
     logprobs = jax.nn.log_softmax(logits, axis=-1) # [batch, time, vocab_size]
     logprobs = jnp.sum(logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
     return logprobs
 
-@partial(jax.jit, out_shardings=(train_state_shard, None))
+@partial(jax.jit, out_shardings=(train_state_shard, None), donate_argnums=(0,))
 def update(train_state: TrainState, token_batch, mask_origin, advantages_in, recalc_logprobs, inference_logprobs):
     print("JIT compiling update function for token_batch of shape", token_batch.shape)
-    text_input, text_target = token_batch[:, :-1], token_batch[:, 1:]
+    text_target = jnp.concat([token_batch[:, 1:], jnp.zeros((token_batch.shape[0], 1), dtype=token_batch.dtype)], axis=-1)
     inference_logprobs = inference_logprobs[:, 1:]
     mask_origin = mask_origin[:, 1:]
     is_max_tokens = (mask_origin[:, -1] == True)
-    token_mask = jnp.where(text_input != pad_id, 1, 0).astype(jnp.int32)
+    token_mask = jnp.where(token_batch != pad_id, 1, 0).astype(jnp.int32)
     def loss_fn(grad_params):
-        logits, _ = train_state.call_model(text_input, token_mask, cache=None, params=grad_params)
+        if not FLAGS.train_vocab:
+            grad_params['Dense_0']['kernel'] = jax.lax.stop_gradient(grad_params['Dense_0']['kernel'])
+            grad_params['Embed_0']['embedding'] = jax.lax.stop_gradient(grad_params['Embed_0']['embedding'])
+        logits, _ = train_state.call_model(token_batch, token_mask, cache=None, params=grad_params)
         all_logprobs = jax.nn.log_softmax(logits) # [batch, time, vocab_size]
         token_logprobs = jnp.sum(all_logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
+
+        token_logprobs = token_logprobs[:, :-1]  # [batch, time-1]
         entropy = -jnp.sum(jax.nn.softmax(logits) * all_logprobs, axis=-1)
+        entropy = entropy[:, :-1]  # [batch, time-1]
 
         old_logprobs = inference_logprobs if FLAGS.do_inference_logprobs else recalc_logprobs
         ratio_recompute_inference = jnp.exp(inference_logprobs - recalc_logprobs)
@@ -206,6 +231,8 @@ def update(train_state: TrainState, token_batch, mask_origin, advantages_in, rec
             'trained_tokens_per_seq': jnp.mean(jnp.sum(mask, axis=-1)),
             'is_max_tokens': jnp.mean(is_max_tokens),
         }
+    print(print_saved_residuals(loss_fn, train_state.params))
+    # breakpoint()
     grads, info = jax.grad(loss_fn, has_aux=True)(train_state.params)
     updates, opt_state = train_state.tx.update(grads, train_state.opt_state, train_state.params)
     new_params = optax.apply_updates(train_state.params, updates)
@@ -224,7 +251,9 @@ assert rollout_batch_size % FLAGS.group_size == 0
 rng = jax.random.PRNGKey(jax.process_index())
 total_rollouts = 0
 
-for i in tqdm.tqdm(range(10000)):
+if jax.process_index() == 0 and FLAGS.profile:
+    print("Profiling enabled, saving.")
+for i in tqdm.tqdm(range(FLAGS.max_steps)):
 
     # Fill this global on-policy buffer with groups that have A != 0.
     buffer_tokens = []
@@ -247,7 +276,7 @@ for i in tqdm.tqdm(range(10000)):
                 env_tokens.append(output_tokens)
 
         prompt_tokens = pad_and_collate(env_tokens, pad_id=pad_id, force_length=FLAGS.prompt_length)
-        prompt_tokens = shard_data_fn(prompt_tokens, sharding=data_shard_dp)
+        prompt_tokens = shard_data_fn(prompt_tokens)
         num_generation_tokens = FLAGS.num_generation_tokens
         rng, key = jax.random.split(rng)
         action_tokens, action_logprobs = autoregressive_sample(
@@ -264,11 +293,11 @@ for i in tqdm.tqdm(range(10000)):
         new_states, _, returns_local, dones, env_infos = env.step_list(env_states, [t.tolist() for t in action_tokens_local])
         assert dones[0] # Only supports bandit envs for now.
         returns_local = np.array(returns_local)
-        returns = host_gather(shard_data_fn(returns_local, sharding=data_shard_dp))
+        returns = host_gather(shard_data_fn(returns_local))
         for k, v in env_infos.items():
             if k not in env_infos_history:
                 env_infos_history[k] = []
-            v_global = host_gather(shard_data_fn(np.array(v), sharding=data_shard_dp))
+            v_global = host_gather(shard_data_fn(np.array(v)))
             env_infos_history[k] += v_global.tolist()
         env_infos_history['return'] += returns.tolist()
 
@@ -324,6 +353,7 @@ for i in tqdm.tqdm(range(10000)):
         host_id = jax.process_index()
         host_slice = FLAGS.ppo_minibatch // jax.process_count()
         x = jnp.reshape(x, (FLAGS.ppo_minibatch, -1, *x.shape[1:]))
+        x = x[host_id * host_slice : (host_id + 1) * host_slice, :]
         x = shard_data_fn(x)
         return x # [ppo_minibatch, num_minibatches (j), ...] where first dim is sharded.
 
@@ -357,38 +387,45 @@ for i in tqdm.tqdm(range(10000)):
 
     # Then, the training loop.
     update_time_start = time.time()
-    for j in range(global_batch_size // FLAGS.ppo_minibatch):
-        train_state, info = update(train_state, tokens_all_minibatch[:, j], mask_minibatch[:, j], advantages_minibatch[:, j], 
-                                   logprobs_all_minibatch[:, j], inference_logprobs_all_minibatch[:, j])
-        info = jax.device_get(info)
-        info['output_tokens'] = eos_idx
-        info = jax.tree.map(lambda x: np.array(x), info)
-        info = jax.tree.map(lambda x: x.mean(), info)
-        info['total_rollouts'] = total_rollouts
-        if env.num_tasks != -1:
-            info['env_epochs'] = total_rollouts / env_num_tasks
-        info['rollout_iters_per_update'] = num_rollout_iters
-        info['global_step'] = i
-        info['times/time_per_inference_iteration'] = rollout_total_time / num_rollout_iters
-        info['times/time_per_rollout'] = rollout_total_time / (num_rollout_iters * rollout_batch_size * jax.host_count())
-        info['times/time_per_effective_rollout'] = rollout_total_time / global_batch_size
-        info['times/total_time_rollouts'] = rollout_total_time
-        info['times/total_time_update'] = time.time() - update_time_start
-        info['effective_rollout_ratio'] = global_batch_size / (rollout_batch_size * jax.host_count() * num_rollout_iters)
-        info['minibatches_per_global_step'] = global_batch_size // FLAGS.ppo_minibatch
-        for k, v in env_infos_history.items():
-            info['env/'+k] = np.mean(v)
-        if jax.process_index() == 0:
-            rollouts_list.append([i, env.render(new_states[0]), returns_local[0]])
-            if i % 100 == 0 and j == 0:
-                rollouts_table = wandb.Table(data=rollouts_list, columns=["step", "text", "reward"])
-                info['rollouts_table'] = rollouts_table
-            if j == global_batch_size // FLAGS.ppo_minibatch - 1:
-                print(f'=================== Iter {i} ===================')
-                for k, v in info.items():
-                    if k not in ['rollouts_table']:
-                        print(f"{k}: {v}")
-            wandb.log(info)
+    with jax.profiler.trace('/mount/code/dqlm/lmpo/tensorboard') if jax.process_index() == 0 and FLAGS.profile else contextlib.nullcontext():
+        for j in range(global_batch_size // FLAGS.ppo_minibatch):
+            print("Memory usage before update:", get_memory_usage(), "GB")
+            pre_update_time = time.time()
+            train_state, info = update(train_state, tokens_all_minibatch[:, j], mask_minibatch[:, j], advantages_minibatch[:, j], 
+                                    logprobs_all_minibatch[:, j], inference_logprobs_all_minibatch[:, j])
+            
+            info = jax.device_get(info)
+            info['output_tokens'] = eos_idx
+            info['times/time_single_update'] = time.time() - pre_update_time
+            info = jax.tree.map(lambda x: np.array(x), info)
+            info = jax.tree.map(lambda x: x.mean(), info)
+            for k, v in env_infos_history.items():
+                info['env/'+k] = np.mean(v)
+            if jax.process_index() == 0:
+                rollouts_list.append([i, env.render(new_states[0]), returns_local[0]])
+                if i % 100 == 0 and j == 0:
+                    rollouts_table = wandb.Table(data=rollouts_list, columns=["step", "text", "reward"])
+                    info['rollouts_table'] = rollouts_table
+                if j == global_batch_size // FLAGS.ppo_minibatch - 1:
+
+                    info['total_rollouts'] = total_rollouts
+                    if env.num_tasks != -1:
+                        info['env_epochs'] = total_rollouts / env_num_tasks
+                    info['rollout_iters_per_update'] = num_rollout_iters
+                    info['global_step'] = i
+                    info['times/time_per_inference_iteration'] = rollout_total_time / num_rollout_iters
+                    info['times/time_per_rollout'] = rollout_total_time / (num_rollout_iters * rollout_batch_size * jax.host_count())
+                    info['times/time_per_effective_rollout'] = rollout_total_time / global_batch_size
+                    info['times/total_time_rollouts'] = rollout_total_time
+                    info['times/total_time_update'] = time.time() - update_time_start
+                    info['effective_rollout_ratio'] = global_batch_size / (rollout_batch_size * jax.host_count() * num_rollout_iters)
+                    info['minibatches_per_global_step'] = global_batch_size // FLAGS.ppo_minibatch
+
+                    print(f'=================== Iter {i} ===================')
+                    for k, v in info.items():
+                        if k not in ['rollouts_table']:
+                            print(f"{k}: {v}")
+                wandb.log(info)
 
     if i % FLAGS.test_interval == 0 and env_test is not None:
         _, test_env_history = eval_model(
