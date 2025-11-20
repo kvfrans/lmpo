@@ -216,6 +216,16 @@ class Block(nn.Module):
         x = x + mlp_x
         return x, k, v
 
+#     num_layers=28,
+#     vocab_size=151936,
+#     embed_dim=2048,
+#     hidden_dim=6144,
+#     num_heads=16,
+#     head_dim=128,
+#     num_kv_heads=8,
+#     norm_eps=1e-06,
+#     rope_theta=1_000_000,
+
 class Qwen3Model(nn.Module):
     hidden_size: int
     q_heads: int
@@ -228,6 +238,7 @@ class Qwen3Model(nn.Module):
     eps: float = 1e-6
     use_v_head: bool = False
     use_remat: bool = False
+    use_flash_attn: bool = True
 
     @nn.compact
     def __call__(self, x, token_mask, cache = None, get_logits=True):
@@ -268,7 +279,7 @@ class Qwen3Model(nn.Module):
 
         BlockFn = Block if not self.use_remat else nn.remat(Block, static_argnums=6)
         for layer_id in range(self.num_layers):
-            x, k, v = BlockFn(hidden_size=self.hidden_size, q_heads=self.q_heads, kv_heads=self.kv_heads, head_dim=self.head_dim, mlp_ffw_size=self.mlp_ffw_size, eps=self.eps)(x, sin, cos, mask, token_mask, layer_id, cache)
+            x, k, v = BlockFn(hidden_size=self.hidden_size, q_heads=self.q_heads, kv_heads=self.kv_heads, head_dim=self.head_dim, mlp_ffw_size=self.mlp_ffw_size, eps=self.eps, use_flash_attn=self.use_flash_attn)(x, sin, cos, mask, token_mask, layer_id, cache)
             if cache is not None:
                 cache.k[layer_id] = k
                 cache.v[layer_id] = v
@@ -362,7 +373,7 @@ def create_model_from_hf(hf_dir: str):
     
     return model, params
 
-def create_model_from_ckpt(ckpt_dir: str, use_v_head: bool = False, use_remat: bool = False):
+def create_model_from_ckpt(ckpt_dir: str, use_v_head: bool = False, use_remat: bool = False, use_flash_attn: bool = False):
     from lmpo.utils.checkpoint import Checkpoint
     with open(ckpt_dir + "config.json") as f:
         cfg = json.load(f)
@@ -378,6 +389,7 @@ def create_model_from_ckpt(ckpt_dir: str, use_v_head: bool = False, use_remat: b
         rope_theta=cfg['rope_theta'],
         use_v_head=use_v_head,
         use_remat=use_remat,
+        use_flash_attn=use_flash_attn,
     )
     ckpt = Checkpoint(ckpt_dir + "params.pkl", parallel=False)
     params = ckpt.load_as_dict()['params']

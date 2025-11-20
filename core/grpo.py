@@ -1,43 +1,6 @@
-import os
-# This flag is important when using FSDP to prevent excessive communication buffers.
-# Must be set before jax is imported.
-os.environ['LIBTPU_INIT_ARGS'] = '--xla_tpu_enable_latency_hiding_scheduler=false --xla_should_allow_loop_variant_parameter_in_chain=enabled --xla_should_add_loop_invariant_op_in_chain=enabled --xla_tpu_enable_ici_ag_pipelining=true'
-
-import ml_collections
-from absl import app, flags;
 import sys
-from lmpo.utils.configs import define_flag_dict
-import jax.numpy as jnp
-import jax
-import numpy as np
-import tqdm
-import optax
-from functools import partial
-import wandb
-import time
-import shutil
-
-import contextlib
-from jax.ad_checkpoint import print_saved_residuals
-
-try: # If you like to use these helpers, you can.
-    from jax.experimental.compilation_cache import compilation_cache as cc
-    cc.set_cache_dir('/home/kvfrans/jax-cache')
-    from localutils.debugger import enable_debug
-    enable_debug()
-except:
-    pass
-
-from lmpo.models.qwen3 import create_model_from_ckpt
-from lmpo.utils.wandb import setup_wandb
-from lmpo.envs.env_creator import create_env
-from lmpo.utils.sharding import create_sharding, host_gather, get_memory_usage, get_local_slice
-from lmpo.utils.train_state import TrainState
-from lmpo.models.tokenizer import create_tokenizer
-from lmpo.utils.checkpoint import Checkpoint
-from lmpo.core.sampling import pad_and_collate, autoregressive_sample
-from lmpo.core.eval import eval_model
-
+import ml_collections
+from absl import app, flags
 config = ml_collections.ConfigDict({
     'wandb_project': "lmpo",
     'wandb_name': 'lmpo-run',
@@ -85,13 +48,50 @@ config = ml_collections.ConfigDict({
     'save_rollouts_dir': 'rollouts/',
     'profile': 0, 
 })
-
+from lmpo.utils.configs import define_flag_dict
 define_flag_dict(config)
 FLAGS = flags.FLAGS
 FLAGS(sys.argv)
 
-if not FLAGS.use_xla_flags:
-    assert "Disable the XLS flags manually if you want to set use_xla_flags to False."
+import os
+# This flag is important when using FSDP to prevent excessive communication buffers.
+# Must be set before jax is imported.
+if FLAGS.use_xla_flags:
+    os.environ['LIBTPU_INIT_ARGS'] = '--xla_tpu_enable_latency_hiding_scheduler=false'
+
+
+import jax.numpy as jnp
+import jax
+import numpy as np
+import tqdm
+import optax
+from functools import partial
+import wandb
+import time
+import shutil
+
+import contextlib
+from jax.ad_checkpoint import print_saved_residuals
+
+try: # If you like to use these helpers, you can.
+    from jax.experimental.compilation_cache import compilation_cache as cc
+    cc.set_cache_dir('/home/kvfrans/jax-cache')
+    from localutils.debugger import enable_debug
+    enable_debug()
+except:
+    pass
+
+from lmpo.models.qwen3 import create_model_from_ckpt
+from lmpo.utils.wandb import setup_wandb
+from lmpo.envs.env_creator import create_env
+from lmpo.utils.sharding import create_sharding, host_gather, get_memory_usage, get_local_slice
+from lmpo.utils.train_state import TrainState
+from lmpo.models.tokenizer import create_tokenizer
+from lmpo.utils.checkpoint import Checkpoint
+from lmpo.core.sampling import pad_and_collate, autoregressive_sample
+from lmpo.core.eval import eval_model
+
+
 
 if jax.process_index() == 0:
     setup_wandb(FLAGS.flag_values_dict(), project=FLAGS.wandb_project, name=FLAGS.env_name+'-'+FLAGS.wandb_name, group=FLAGS.wandb_group)
@@ -100,7 +100,7 @@ if jax.process_index() == 0:
 host_id = jax.process_index()
                                           
 ckpt_dir = FLAGS.model_dir
-model, params = create_model_from_ckpt(ckpt_dir, use_remat=bool(FLAGS.use_remat))
+model, params = create_model_from_ckpt(ckpt_dir, use_remat=bool(FLAGS.use_remat), use_flash_attn=bool(FLAGS.use_flash_attn))
 tx = optax.chain(
     optax.clip_by_global_norm(1.0),
     optax.adamw(FLAGS.lr, b1=0.9, b2=0.95, weight_decay=FLAGS.weight_decay),
@@ -231,7 +231,7 @@ def update(train_state: TrainState, token_batch, mask_origin, advantages_in, rec
             'trained_tokens_per_seq': jnp.mean(jnp.sum(mask, axis=-1)),
             'is_max_tokens': jnp.mean(is_max_tokens),
         }
-    print(print_saved_residuals(loss_fn, train_state.params))
+    # print(print_saved_residuals(loss_fn, train_state.params))
     # breakpoint()
     grads, info = jax.grad(loss_fn, has_aux=True)(train_state.params)
     updates, opt_state = train_state.tx.update(grads, train_state.opt_state, train_state.params)
@@ -387,7 +387,7 @@ for i in tqdm.tqdm(range(FLAGS.max_steps)):
 
     # Then, the training loop.
     update_time_start = time.time()
-    with jax.profiler.trace('/mount/code/dqlm/lmpo/tensorboard') if jax.process_index() == 0 and FLAGS.profile else contextlib.nullcontext():
+    with jax.profiler.trace(f'/mount/code/dqlm/lmpo/tensorboard/{FLAGS.wandb_name}') if jax.process_index() == 0 and FLAGS.profile else contextlib.nullcontext():
         for j in range(global_batch_size // FLAGS.ppo_minibatch):
             print("Memory usage before update:", get_memory_usage(), "GB")
             pre_update_time = time.time()
