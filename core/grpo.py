@@ -221,7 +221,7 @@ def update(train_state: TrainState, token_batch, mask_origin, advantages_in, rec
             'inference_recompute/prob_diff_99quantile': jnp.quantile(inference_recompute_prob_diff, 0.99),
             'inference_recompute/prob_diff_max': jnp.max(inference_recompute_prob_diff),
             'clip_fraction': clip_fracs,
-            'logprob_of_token': logprob_of_token,
+            'neg_logprob_of_token': logprob_of_token,
             'importance_ratio/mean': importance_ratio,
             'importance_ratio/magnitude': importance_ratio_mag,
             'importance_ratio/99quantile': jnp.quantile(ratio * mask, 0.99),
@@ -308,7 +308,7 @@ for i in tqdm.tqdm(range(FLAGS.max_steps)):
             rollouts_buffer_returns.append(np.array(returns))
             if len(rollouts_buffer_prompts) > 100:
                 print("Saving rollouts buffer to disk...")
-                np.savez_compressed(FLAGS.save_dir + f'{FLAGS.save_rollouts_dir}/rollouts_buffer_{rollouts_buffer_iter}.npz',
+                np.savez_compressed(f'{FLAGS.save_rollouts_dir}/rollouts_buffer_{rollouts_buffer_iter}.npz',
                                     prompts=np.concatenate(rollouts_buffer_prompts, axis=0),
                                     actions=np.concatenate(rollouts_buffer_actions, axis=0),
                                     returns=np.concatenate(rollouts_buffer_returns, axis=0))

@@ -399,4 +399,10 @@ def create_model_from_ckpt(ckpt_dir: str, use_v_head: bool = False, use_remat: b
             if 'Block' in key:
                 params['Checkpoint'+key] = params.pop(key)
 
+    if 'CheckpointBlock_0' in params.keys() and not use_remat:
+        for key in list(params.keys()):
+            if 'CheckpointBlock' in key:
+                new_key = key.replace('Checkpoint','')
+                params[new_key] = params.pop(key)
+
     return model, params

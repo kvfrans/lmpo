@@ -22,11 +22,14 @@ def eval_model(model, params, env,
                shard_data_fn,
                no_shard,
                data_shard,
-               num_epochs
+               num_epochs,
+               force_subsample
                ):
     np.random.seed(jax.process_index())
     host_id = jax.process_index()
     env_num_tasks = env.num_tasks if env.num_tasks != -1 else 512
+    if force_subsample != -1:
+        env_num_tasks = min(force_subsample, env_num_tasks)
     total_num_tasks = num_epochs * env_num_tasks
     env_task_idx = 0
     rollout_batch_size = jax.local_device_count() * inference_batch_per_device
@@ -50,7 +53,7 @@ def eval_model(model, params, env,
         rng, key = jax.random.split(rng)
         action_tokens = autoregressive_sample(
             model, params, prompt_tokens, rng=key, num_generation_tokens=num_generation_tokens, 
-            pad_id=pad_id, data_shard=data_shard, no_shard=no_shard, force_answer_at=force_answer_at,
+            pad_id=pad_id, data_shard=data_shard, no_shard=no_shard, params_shard=no_shard, force_answer_at=force_answer_at,
         )
         prompt_tokens = host_gather(prompt_tokens)
         action_tokens = host_gather(action_tokens)
@@ -75,6 +78,15 @@ def eval_model(model, params, env,
 ### Runnable function to eval a checkpoint on an env.
 ##################################################
 if __name__ == '__main__':
+
+    try: # If you like to use these helpers, you can.
+        from jax.experimental.compilation_cache import compilation_cache as cc
+        cc.set_cache_dir('/home/kvfrans/jax-cache')
+        from localutils.debugger import enable_debug
+        enable_debug()
+    except:
+        pass
+
     config = ml_collections.ConfigDict({
         'model_dir': '/gcs/jaxconverted/Qwen3-1.7B/',
         # env settings.
@@ -83,6 +95,7 @@ if __name__ == '__main__':
         'force_answer_at': -1, # -1 = use default from env.
         'prompt_length': 256, # Length of the prompt to pad to.
         'num_epochs': 1,
+        'force_subsample': -1,
         # sampling settings.
         'inference_batch_per_device': 16, # Set this to the maximum until OOM. Should not affect results.
     })
@@ -93,10 +106,11 @@ if __name__ == '__main__':
     ckpt_dir = FLAGS.model_dir
     model, params = create_model_from_ckpt(ckpt_dir)
     rng = jax.random.PRNGKey(0)
-    params_shard, no_shard, data_shard, shard_data_fn = create_sharding('fsdp', params)
+    # params_shard, no_shard, data_shard, shard_data_fn = create_sharding('fsdp', params)
+    params_shard, no_shard, data_shard, data_shard_dp, shard_data_fn = create_sharding('dp', params)
     params = jax.jit(lambda x: x, out_shardings=params_shard)(params)
 
-    jax.debug.visualize_array_sharding(params['Block_0']['Dense_0']['kernel'])
+    # jax.debug.visualize_array_sharding(params['Block_0']['Dense_0']['kernel'])
     tokenizer = create_tokenizer(ckpt_dir)
     pad_id = tokenizer.get_pad_token_id()
 
@@ -117,6 +131,7 @@ if __name__ == '__main__':
         no_shard=no_shard,
         data_shard=data_shard,
         num_epochs=FLAGS.num_epochs,
+        force_subsample=FLAGS.force_subsample,
     )
     print(" ======================= Example Rollout ======================= ")
     print(env.render(new_states[0]))
