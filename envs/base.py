@@ -2,6 +2,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class BaseState:
+    task_id: int
+
     def render(self) -> str:
         raise NotImplementedError
 

@@ -21,7 +21,8 @@ from jax.ad_checkpoint import print_saved_residuals
 
 try: # If you like to use these helpers, you can.
     from jax.experimental.compilation_cache import compilation_cache as cc
-    cc.set_cache_dir('/home/kvfrans/jax-cache')
+    # cc.set_cache_dir('/home/kvfrans/jax-cache')
+    cc.set_cache_dir('/gcs/jax-cache')
     from localutils.debugger import enable_debug
     enable_debug()
 except:
@@ -35,7 +36,7 @@ from lmpo.utils.train_state import TrainState
 from lmpo.models.tokenizer import create_tokenizer
 from lmpo.utils.checkpoint import Checkpoint
 from lmpo.core.sampling import pad_and_collate, autoregressive_sample
-from lmpo.core.eval import eval_model
+from lmpo.core.eval import eval_model, get_pass_at_k
 from lmpo.utils.configs import define_flag_dict
 
 config = ml_collections.ConfigDict({
@@ -47,11 +48,11 @@ config = ml_collections.ConfigDict({
     'save_interval': 20,
     'max_steps': 10000,
     # env settings.
-    'env_name': 'poem', # (poem, gsm8k, countdown)
+    'env_name': 'deepscaler', # (poem, gsm8k, countdown)
     'num_generation_tokens': -1, # -1 = use default from env.
     'prompt_length': 256,
     'force_answer_at': -1, # -1 = use default from env.
-    'test_env_name': '',
+    'test_envs': 'math500,aime2024,aime2025,hmmt2025,amc2023', # comma separated
     'test_interval': 10,
     # sampling settings.
     'prefill_batch_split': 4,
@@ -68,11 +69,13 @@ config = ml_collections.ConfigDict({
     'do_mask_inference_ratio': 0, # Mask out tokens with a bad inference/recompute ratio.
     'do_mask_importance_ratio': 0, # Mask out tokens with a bad importance ratio.
     'negative_advantage_multiplier': 1.0,
+    'do_contrastive_negative': 0,
     'lr': 1e-6,
-    'clip_epsilon': 0.2,
+    'clip_epsilon_low': 0.2,
+    'clip_epsilon_high': 0.2,
     'do_ppo_all_clip': 0, # Clips both sides of ratio.
     'entropy_coef': 0.001,
-    'kl_coef': 0.001,
+    # 'kl_coef': 0.001,
     'weight_decay': 1e-2,
     'train_vocab': 1,
     # Compute graph settings
@@ -95,6 +98,7 @@ if not FLAGS.use_xla_flags:
 if jax.process_index() == 0:
     setup_wandb(FLAGS.flag_values_dict(), project=FLAGS.wandb_project, name=FLAGS.env_name+'-'+FLAGS.wandb_name, group=FLAGS.wandb_group)
     rollouts_list = []
+test_rollouts_lists = {}
 
 host_id = jax.process_index()
                                           
@@ -117,7 +121,6 @@ tokenizer = create_tokenizer(ckpt_dir)
 pad_id = tokenizer.get_pad_token_id()
 
 env = create_env(FLAGS.env_name, tokenizer)
-env_test = create_env(FLAGS.test_env_name, tokenizer) if FLAGS.test_env_name != '' else None
 
 if FLAGS.num_generation_tokens == -1:
     FLAGS.num_generation_tokens = env.tokens_per_action
@@ -182,10 +185,10 @@ def update(train_state: TrainState, token_batch, mask_origin, advantages_in, rec
         logratio = token_logprobs - old_logprobs
         ratio = jnp.exp(logratio)
         if FLAGS.do_ppo_all_clip:
-            pg_loss = -advantages[:, None] * jnp.clip(ratio, 1 - FLAGS.clip_epsilon, 1 + FLAGS.clip_epsilon)
+            pg_loss = -advantages[:, None] * jnp.clip(ratio, 1 - FLAGS.clip_epsilon_low, 1 + FLAGS.clip_epsilon_high)
         else:
             pg_loss1 = -advantages[:, None] * ratio
-            pg_loss2 = -advantages[:, None] * jnp.clip(ratio, 1 - FLAGS.clip_epsilon, 1 + FLAGS.clip_epsilon)
+            pg_loss2 = -advantages[:, None] * jnp.clip(ratio, 1 - FLAGS.clip_epsilon_low, 1 + FLAGS.clip_epsilon_high)
             pg_loss = jnp.maximum(pg_loss1, pg_loss2)
 
         mask = mask_origin
@@ -200,7 +203,7 @@ def update(train_state: TrainState, token_batch, mask_origin, advantages_in, rec
         importance_ratio_mag = avg_over_mask(jnp.abs(1 - ratio))
         approx_kl = avg_over_mask((ratio - 1) - logratio)
         entropy_avg = avg_over_mask(entropy)
-        clip_fracs = avg_over_mask(jnp.abs(ratio - 1.0) > FLAGS.clip_epsilon)
+        clip_fracs = avg_over_mask(((ratio - 1.0) > FLAGS.clip_epsilon_high) | ((1.0 - ratio > FLAGS.clip_epsilon_low)))
         logprob_of_token = avg_over_mask(-token_logprobs)
         inference_recompute_kl = avg_over_mask((ratio_recompute_inference - 1) - (inference_logprobs - recalc_logprobs))
         inference_recompute_prob_diff = jnp.abs(jnp.exp(inference_logprobs) - jnp.exp(recalc_logprobs)) * mask
@@ -401,8 +404,8 @@ for i in tqdm.tqdm(range(FLAGS.max_steps)):
             for k, v in env_infos_history.items():
                 info['env/'+k] = np.mean(v)
             if jax.process_index() == 0:
-                rollouts_list.append([i, env.render(new_states[0]), returns_local[0]])
-                if i % 100 == 0 and j == 0:
+                if i % 10 == 0 and j == 0:
+                    rollouts_list.append([i, env.render(new_states[0]), returns_local[0]])
                     rollouts_table = wandb.Table(data=rollouts_list, columns=["step", "text", "reward"])
                     info['rollouts_table'] = rollouts_table
                 if j == global_batch_size // FLAGS.ppo_minibatch - 1:
@@ -426,24 +429,39 @@ for i in tqdm.tqdm(range(FLAGS.max_steps)):
                             print(f"{k}: {v}")
                 wandb.log(info)
 
-    if i % FLAGS.test_interval == 0 and env_test is not None:
-        _, test_env_history = eval_model(
-            model=train_state.model_def,
-            params=train_state.params,
-            env=env_test,
-            num_generation_tokens=FLAGS.num_generation_tokens,
-            force_answer_at=FLAGS.force_answer_at,
-            prompt_length=FLAGS.prompt_length,
-            inference_batch_per_device=FLAGS.inference_batch_per_device,
-            pad_id=pad_id,
-            shard_data_fn=shard_data_fn,
-            no_shard=no_shard,
-            data_shard=data_shard,
-            num_epochs=1,
-        )
-        test_info = {f'test_env/{k}': np.mean(v) for k, v in test_env_history.items()}
-        if jax.process_index() == 0:
-            wandb.log(test_info, commit=False)
+    if i % FLAGS.test_interval == 0 and FLAGS.test_envs != '':
+        for test_env_name in FLAGS.test_envs.split(','):
+            test_rollouts_lists[test_env_name] = test_rollouts_lists.get(test_env_name, [])
+            env_test = create_env(test_env_name, tokenizer)
+            do_many_trials = env_test.num_tasks < 100 and env_test.num_tasks != -1
+            test_env_states, test_env_history = eval_model(
+                model=train_state.model_def,
+                params=train_state.params,
+                env=env_test,
+                num_generation_tokens=FLAGS.num_generation_tokens,
+                force_answer_at=FLAGS.force_answer_at,
+                prompt_length=FLAGS.prompt_length,
+                inference_batch_per_device=FLAGS.inference_batch_per_device,
+                pad_id=pad_id,
+                shard_data_fn=shard_data_fn,
+                no_shard=no_shard,
+                data_shard=data_shard,
+                num_epochs=8 if do_many_trials else 1,
+                force_subsample=-1,
+            )
+
+            test_info = {f'test/{test_env_name}/{k}': np.mean(v) for k, v in test_env_history.items()}
+            if do_many_trials:
+                test_info[f'test/{test_env_name}/pass_at_2'] = get_pass_at_k(test_env_history, k=2)
+                test_info[f'test/{test_env_name}/pass_at_4'] = get_pass_at_k(test_env_history, k=4)
+                test_info[f'test/{test_env_name}/pass_at_8'] = get_pass_at_k(test_env_history, k=8)
+
+            test_rollouts_lists[test_env_name].append([i, env_test.render(test_env_states[0]), test_env_states[0].reward])
+            rollouts_table = wandb.Table(data=test_rollouts_lists[test_env_name], columns=["step", "text", "reward"])
+            info[f'test/{test_env_name}/rollouts_table'] = rollouts_table
+
+            if jax.process_index() == 0:
+                wandb.log(test_info, commit=False)
 
     # This only saves the params. If you want to save the optimizer, gather the whole train_state.
     if i % FLAGS.save_interval == 0 and FLAGS.save_dir != "":

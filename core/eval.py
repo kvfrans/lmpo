@@ -38,6 +38,7 @@ def eval_model(model, params, env,
 
     env_infos_history = {}
     env_infos_history['return'] = []
+    env_infos_history['task_id'] = []
     for i in tqdm.tqdm(range(total_num_tasks // global_batch_size + 1)):
         env_states, env_tokens = [], []
         for _ in range(rollout_batch_size):
@@ -68,10 +69,25 @@ def eval_model(model, params, env,
             v_global = host_gather(shard_data_fn(np.array(v)))
             env_infos_history[k] += v_global.tolist()
         env_infos_history['return'] += returns.tolist()
+        env_infos_history['task_id'] += [env_state.task_id for env_state in env_states]
     env_infos_history = {k: np.array(v)[:total_num_tasks] for k, v in env_infos_history.items()}
     return new_states, env_infos_history
 
 
+def get_pass_at_k(env_infos_history, k=1):
+    # Pass@K for first K attempts per task-id.
+    task_dict = {}
+    for task_id, ret in zip(env_infos_history['task_id'], env_infos_history['return']):
+        if task_id not in task_dict:
+            task_dict[task_id] = []
+        task_dict[task_id].append(ret)
+    num_tasks = len(task_dict)
+    num_passed = 0
+    for task_id, rets in task_dict.items():
+        if np.any(np.array(rets[:k]) == 1.0):
+            num_passed += 1
+    pass_at_k = num_passed / num_tasks
+    return pass_at_k
 
 
 ######$###########################################

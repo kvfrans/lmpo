@@ -52,12 +52,32 @@ job_list = []
 # job_list.append(base + ' --wandb_name Baseline-4096 --env_name deepscaler --num_generation_tokens 4096 --inference_batch_per_device 32 --ppo_minibatch 32 --save_rollouts_dir /gcs/data/offlinelmpo/v3-deepscaler-4096/ --do_save_rollouts 1 --groups_per_batch 32 --negative_advantage_multiplier 0.6  --prompt_length 512 --save_dir /gcs/checkpoints/offlinelmpo/v3-deepscaler-4096/')
 # job_list.append(base + ' --wandb_name Baseline-8192 --env_name deepscaler --num_generation_tokens 8192 --inference_batch_per_device 16 --ppo_minibatch 32 --save_rollouts_dir /gcs/data/offlinelmpo/v3-deepscaler-8192/ --do_save_rollouts 1 --groups_per_batch 16 --negative_advantage_multiplier 0.6  --prompt_length 512 --save_dir /gcs/checkpoints/offlinelmpo/v3-deepscaler-8192/')
 
+# job_list.append(base + ' --wandb_name Baseline-4096-AdvMult1 --env_name deepscaler --num_generation_tokens 4096 --inference_batch_per_device 32 --ppo_minibatch 32 --save_rollouts_dir /gcs/data/offlinelmpo/v3-deepscaler-4096-advmult1/ --do_save_rollouts 1 --groups_per_batch 32 --negative_advantage_multiplier 1  --prompt_length 512 --save_dir /gcs/checkpoints/offlinelmpo/v3-deepscaler-4096-advmult1/')
+# job_list.append(base + ' --wandb_name Baseline-4096-AdvMult0.9 --env_name deepscaler --num_generation_tokens 4096 --inference_batch_per_device 32 --ppo_minibatch 32 --save_rollouts_dir /gcs/data/offlinelmpo/v3-deepscaler-4096-advmult0.9/ --do_save_rollouts 1 --groups_per_batch 32 --negative_advantage_multiplier 0.9  --prompt_length 512 --save_dir /gcs/checkpoints/offlinelmpo/v3-deepscaler-4096-advmult0.9/')
 
-base = 'export HF_DATASETS_CACHE=/home/kvfrans/hf_cache; '
+
+# base = 'sudo chmod -R 777 /mount/code/dqlm/lmpo/datasets/hf_cache; export HF_DATASETS_CACHE=/mount/code/dqlm/lmpo/datasets/hf_cache; python core/grpo.py --wandb_group Dec8-Math --entropy_coef 0 --do_mask_inference_ratio 1 --inference_batch_per_device 32 --ppo_minibatch 32 --groups_per_batch 32 --negative_advantage_multiplier 1  --prompt_length 512 --num_generation_tokens 4096'
+# job_list.append(base + ' --wandb_name Deepscaler-Baseline-4096')
+# job_list.append(base + ' --wandb_name E3Easy-Baseline-4096 --env_name e3-easy')
+# job_list.append(base + ' --wandb_name Hicra-Baseline-4096 --env_name hicra')
+# job_list.append(base + ' --wandb_name Baseline-4096-10xLowLR --lr 1e-7')
+# job_list.append(base + ' --wandb_name Baseline-4096-ClipHigh --clip_epsilon_high 0.5')
+# job_list.append(base + ' --wandb_name Baseline-4096-2xEntropy --entropy_coef 0.002')
+# job_list.append(base + ' --wandb_name Baseline-4096-10xEntropy --entropy_coef 0.01')
+# job_list.append(base + ' --wandb_name Baseline-4096-LargePPOBatch --ppo_minibatch 64')
+# job_list.append(base + ' --wandb_name Baseline-4096-NoWD --weight_decay 0.0')
+
+
+# base = 'export HF_DATASETS_CACHE=/mount/code/dqlm/lmpo/datasets/hf_cache; '
 # job_list.append(base + 'python core/eval.py --env_name deepscaler --num_generation_tokens 1024 --inference_batch_per_device 32 --prompt_length 512 --model_dir /gcs/checkpoints/offlinelmpo/v3-deepscaler-4096/step80/ --force_subsample 2048')
-job_list.append(base + 'python core/eval.py --env_name deepscaler --num_generation_tokens 4096 --inference_batch_per_device 32 --prompt_length 512 --model_dir /gcs/checkpoints/offlinelmpo/v3-deepscaler-1024/step80/ --force_subsample 2048')
+# job_list.append(base + 'python core/eval.py --env_name deepscaler --num_generation_tokens 4096 --inference_batch_per_device 32 --prompt_length 512 --model_dir /gcs/checkpoints/offlinelmpo/v3-deepscaler-1024/step80/ --force_subsample 2048')
+# job_list.append(base + 'python core/eval.py --env_name deepscaler --num_generation_tokens 1024 --inference_batch_per_device 32 --prompt_length 512 --model_dir /gcs/checkpoints/offlinelmpo/v3-deepscaler-1024/step0/ --force_subsample 2048')
 
 
+base = 'export HF_DATASETS_CACHE=/home/kvfrans/hf_cache; python core/grpo.py --wandb_group Dec9-NegativeAdv --entropy_coef 0 --do_mask_inference_ratio 1 --env_name countdown --num_generation_tokens 1024 --inference_batch_per_device 128 --ppo_minibatch 64 --groups_per_batch 128 --test_envs "" '
+# job_list.append(base + ' --negative_advantage_multiplier 0.6 --wandb_name NegAdv0.6')
+# job_list.append(base + ' --negative_advantage_multiplier 1 --wandb_name NegAdv1')
+job_list.append(base + ' --negative_advantage_multiplier 10 --wandb_name NegAdv10')
 
 for job in job_list:
     queue_job('/mount/code/dqlm/lmpo/', job)

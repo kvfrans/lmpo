@@ -137,7 +137,7 @@ class CountdownEnv(BaseEnv):
             add_generation_prompt=True,
             enable_thinking=True
         )
-        state = CountdownState(tokens=output_tokens, numbers=numbers, correct_answer=target)
+        state = CountdownState(tokens=output_tokens, numbers=numbers, correct_answer=target, task_id=idx)
         return state, output_tokens
 
     def render(self, state):
